@@ -97,11 +97,23 @@ const LOCAL_MODEL = 'llama-3.2-3b-instruct';
 // Backend preference: 'auto' (smart fallback), 'local-gpu', 'runpod', 'local'
 const BACKEND_PREFERENCE = process.env.BACKEND_PREFERENCE || 'auto';
 
+// =============================================================================
+// EMBEDDING BACKEND CONFIGURATION - 2-Tier Fallback
+// =============================================================================
+// Tier 1: Local GPU Triton (GTX 1080 with bge_embeddings via Cloudflare tunnel)
+// Tier 2: VPS CPU Triton (triton-embeddings in cluster)
+// =============================================================================
+const EMBEDDING_PRIMARY_URL = process.env.EMBEDDING_PRIMARY_URL; // e.g., https://embeddings.el-jefe.me
+const EMBEDDING_FALLBACK_URL = process.env.EMBEDDING_FALLBACK_URL || 'http://triton-embeddings:8000';
+const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'bge_embeddings';
+
 // Health check cache (avoid hammering backends)
 const healthCache = {
   localGpu: { status: 'unknown', lastCheck: 0 },
   runpod: { status: 'unknown', lastCheck: 0 },
-  local: { status: 'unknown', lastCheck: 0 }
+  local: { status: 'unknown', lastCheck: 0 },
+  embeddingPrimary: { status: 'unknown', lastCheck: 0 },
+  embeddingFallback: { status: 'unknown', lastCheck: 0 }
 };
 const HEALTH_CACHE_TTL = 30000; // 30 seconds
 
@@ -455,7 +467,20 @@ Create question-answer pairs that help students learn effectively.`,
   quiz: `You are an educational quiz generator.
 Create clear, fair quiz questions with correct answers.`,
 
-  general: `You are a helpful AI assistant.`
+  general: `You are a helpful AI assistant.`,
+
+  // Conversational help for education apps
+  educationChat: `You are an educational assistant helping teachers and students with ELL (English Language Learner) education.
+You provide helpful, encouraging responses tailored to the user's context.
+For teachers: Help with understanding proficiency levels, creating learning materials, and supporting diverse learners.
+For students: Provide patient explanations, encourage questions, and adapt to their language level.
+Keep responses concise but thorough. Use simple language when appropriate.`,
+
+  // Bookmark description generation
+  describe: `You are a helpful assistant that generates concise, informative descriptions for web bookmarks.
+Given a URL and title, generate a 1-2 sentence description that captures what the resource is about.
+Focus on being accurate and useful. If you're unsure, describe what you can infer from the title and URL.
+Output only the description, nothing else.`
 };
 
 /**
@@ -556,6 +581,65 @@ app.get('/health', async (req, res) => {
   } catch (error) {
     health.backends.local.status = 'unavailable';
     health.backends.local.error = error.message;
+  }
+
+  // Add embedding backends to health check
+  health.embedding = {
+    primary: {
+      tier: 1,
+      configured: isEmbeddingPrimaryConfigured(),
+      model: EMBEDDING_MODEL,
+      url: EMBEDDING_PRIMARY_URL || 'not configured',
+      status: 'checking...',
+      description: 'Local GPU Triton (bge_embeddings)'
+    },
+    fallback: {
+      tier: 2,
+      model: EMBEDDING_MODEL,
+      url: EMBEDDING_FALLBACK_URL,
+      status: 'checking...',
+      description: 'VPS CPU Triton (always available)'
+    }
+  };
+
+  // Check embedding primary health
+  if (isEmbeddingPrimaryConfigured()) {
+    try {
+      const response = await fetch(`${EMBEDDING_PRIMARY_URL}/v2/health/ready`, {
+        method: 'GET',
+        signal: AbortSignal.timeout(5000)
+      });
+      health.embedding.primary.status = response.ok ? 'healthy' : 'unhealthy';
+    } catch (error) {
+      health.embedding.primary.status = 'offline';
+      health.embedding.primary.note = 'Local GPU/tunnel may be down';
+    }
+  } else {
+    health.embedding.primary.status = 'not_configured';
+  }
+
+  // Check embedding fallback health
+  try {
+    const response = await fetch(`${EMBEDDING_FALLBACK_URL}/v2/health/ready`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(5000)
+    });
+    health.embedding.fallback.status = response.ok ? 'healthy' : 'unhealthy';
+  } catch (error) {
+    health.embedding.fallback.status = 'unavailable';
+    health.embedding.fallback.error = error.message;
+  }
+
+  // Determine active embedding backend
+  if (health.embedding.primary.status === 'healthy') {
+    health.activeEmbeddingBackend = 'primary';
+    health.activeEmbeddingDescription = 'Using Local GPU Triton';
+  } else if (health.embedding.fallback.status === 'healthy') {
+    health.activeEmbeddingBackend = 'fallback';
+    health.activeEmbeddingDescription = 'Using VPS CPU Triton';
+  } else {
+    health.activeEmbeddingBackend = 'none';
+    health.activeEmbeddingDescription = 'No embedding backends available!';
   }
 
   // Determine active backend (what would be used for next request)
@@ -903,14 +987,466 @@ app.post('/api/ai/quiz', async (req, res) => {
 });
 
 /**
+ * Multi-turn chat inference - accepts full messages array
+ * Used for conversational endpoints where history matters
+ */
+async function chatInference(messages, options = {}) {
+  const { maxTokens = 512, temperature = 0.7, forceBackend, skipCache = true } = options;
+
+  const backend = forceBackend || BACKEND_PREFERENCE;
+
+  // Force specific backend
+  if (backend === 'local-gpu') {
+    if (!isLocalGpuConfigured()) {
+      throw new Error('Local GPU requested but not configured');
+    }
+    return callLocalGpu(messages, { maxTokens, temperature });
+  }
+
+  if (backend === 'runpod') {
+    if (!isRunPodConfigured()) {
+      throw new Error('RunPod requested but not configured');
+    }
+    return callRunPod(messages, { maxTokens, temperature });
+  }
+
+  if (backend === 'local') {
+    return callLocal(messages, { maxTokens, temperature });
+  }
+
+  // Auto mode: smart 3-tier fallback with health checks
+  // Tier 1: Local GPU (free, fastest when available)
+  if (isLocalGpuConfigured()) {
+    const localGpuHealthy = await checkBackendHealth('localGpu');
+    if (localGpuHealthy) {
+      try {
+        console.log('[chat-auto] Trying Local GPU (Tier 1)...');
+        return await callLocalGpu(messages, { maxTokens, temperature });
+      } catch (error) {
+        console.warn(`[chat-auto] Local GPU failed: ${error.message}`);
+        healthCache.localGpu = { status: 'unavailable', lastCheck: Date.now() };
+      }
+    }
+  }
+
+  // Tier 2: RunPod GPU (paid, but fast)
+  if (isRunPodConfigured()) {
+    try {
+      console.log('[chat-auto] Trying RunPod GPU (Tier 2)...');
+      return await callRunPod(messages, { maxTokens, temperature });
+    } catch (error) {
+      console.warn(`[chat-auto] RunPod failed: ${error.message}`);
+    }
+  }
+
+  // Tier 3: VPS CPU (always available fallback)
+  console.log('[chat-auto] Falling back to VPS CPU (Tier 3)...');
+  return await callLocal(messages, { maxTokens, temperature });
+}
+
+/**
+ * POST /api/ai/chat
+ * Multi-turn conversational chat endpoint
+ *
+ * Body:
+ * {
+ *   "messages": [
+ *     { "role": "user", "content": "Hello" },
+ *     { "role": "assistant", "content": "Hi! How can I help?" },
+ *     { "role": "user", "content": "Explain ELL proficiency levels" }
+ *   ],
+ *   "context": {
+ *     "app": "educationelly",
+ *     "userRole": "teacher",
+ *     "gradeLevel": 5,
+ *     "ellStatus": "LEP"
+ *   },
+ *   "maxTokens": 512,
+ *   "temperature": 0.7,
+ *   "backend": "auto"
+ * }
+ */
+app.post('/api/ai/chat', async (req, res) => {
+  try {
+    const {
+      messages = [],
+      context = {},
+      maxTokens = 512,
+      temperature = 0.7,
+      backend
+    } = req.body;
+
+    if (!messages || messages.length === 0) {
+      return res.status(400).json({ error: 'Messages array is required' });
+    }
+
+    // Build system prompt based on context
+    let systemPrompt = SYSTEM_PROMPTS.educationChat;
+
+    if (context.app === 'intervalai' || context.app === 'spaced-repetition') {
+      systemPrompt = `You are a learning assistant for a spaced repetition study app.
+Help users understand concepts they're struggling with, provide hints without giving away answers,
+and encourage effective learning habits. Be concise and supportive.`;
+    } else if (context.app === 'code-talk') {
+      systemPrompt = SYSTEM_PROMPTS.code;
+    } else if (context.userRole === 'teacher') {
+      systemPrompt += `\n\nYou are speaking with a teacher. Focus on pedagogical strategies and professional insights.`;
+    } else if (context.userRole === 'student') {
+      const gradeLevel = context.gradeLevel || 'unknown';
+      systemPrompt += `\n\nYou are speaking with a student (grade level: ${gradeLevel}). Use age-appropriate language and be encouraging.`;
+    }
+
+    // Add context info if provided
+    if (context.ellStatus) {
+      systemPrompt += `\nStudent ELL status: ${context.ellStatus}`;
+    }
+    if (context.nativeLanguage) {
+      systemPrompt += `\nStudent native language: ${context.nativeLanguage}`;
+    }
+
+    // Build full messages array with system prompt
+    const fullMessages = [
+      { role: 'system', content: systemPrompt },
+      ...messages
+    ];
+
+    console.log(`[chat] Processing ${messages.length} messages (context: ${context.app || 'general'})`);
+
+    const result = await chatInference(fullMessages, {
+      maxTokens,
+      temperature,
+      forceBackend: backend
+    });
+
+    console.log(`[chat] ✓ Response generated via ${result.backend} (${result.response.length} chars)`);
+
+    res.json({
+      success: true,
+      response: result.response,
+      model: result.model,
+      backend: result.backend,
+      usage: result.usage
+    });
+
+  } catch (error) {
+    console.error('Chat error:', error.message);
+    res.status(500).json({
+      error: 'Chat failed',
+      message: error.message
+    });
+  }
+});
+
+/**
+ * POST /api/ai/describe
+ * Generate description for a bookmark URL
+ *
+ * Body:
+ * {
+ *   "title": "Page title",
+ *   "url": "https://example.com/article",
+ *   "existingDescription": "Optional existing description to enhance",
+ *   "backend": "auto"
+ * }
+ */
+app.post('/api/ai/describe', async (req, res) => {
+  try {
+    const { title, url, existingDescription, backend } = req.body;
+
+    if (!title || !url) {
+      return res.status(400).json({ error: 'Title and URL are required' });
+    }
+
+    console.log(`[describe] Generating description for: ${title.substring(0, 50)}...`);
+
+    // Extract domain and path hints
+    let urlHints = '';
+    try {
+      const urlObj = new URL(url);
+      const domain = urlObj.hostname.replace(/^www\./, '');
+      const pathParts = urlObj.pathname.split('/').filter(Boolean);
+      if (pathParts.length > 0) {
+        urlHints = `Domain: ${domain}, Path hints: ${pathParts.slice(0, 3).join('/')}`;
+      } else {
+        urlHints = `Domain: ${domain}`;
+      }
+    } catch (e) {
+      urlHints = `URL: ${url}`;
+    }
+
+    let prompt = `Generate a brief, informative description for this web bookmark:\n\nTitle: ${title}\n${urlHints}`;
+
+    if (existingDescription) {
+      prompt += `\n\nExisting description (improve or expand): ${existingDescription}`;
+    }
+
+    prompt += '\n\nProvide a 1-2 sentence description:';
+
+    const result = await inference(prompt, {
+      systemPrompt: SYSTEM_PROMPTS.describe,
+      maxTokens: 150,
+      temperature: 0.4,
+      forceBackend: backend
+    });
+
+    // Clean up the response
+    let description = result.response.trim();
+    // Remove any leading quotes or formatting
+    description = description.replace(/^["']|["']$/g, '').trim();
+
+    console.log(`[describe] ✓ Description generated via ${result.backend}`);
+
+    res.json({
+      success: true,
+      description,
+      title,
+      url,
+      model: result.model,
+      backend: result.backend
+    });
+
+  } catch (error) {
+    console.error('Description generation error:', error.message);
+
+    // Fallback: generate a simple description from title
+    const fallbackDesc = `Resource about ${req.body.title || 'this topic'}.`;
+
+    res.json({
+      success: true,
+      description: fallbackDesc,
+      title: req.body.title,
+      url: req.body.url,
+      method: 'fallback',
+      warning: error.message
+    });
+  }
+});
+
+/**
+ * Check if embedding primary backend is configured
+ */
+function isEmbeddingPrimaryConfigured() {
+  return !!EMBEDDING_PRIMARY_URL;
+}
+
+/**
+ * Check embedding backend health (Triton KServe V2)
+ */
+async function checkEmbeddingHealth(backend) {
+  const now = Date.now();
+  const cacheKey = backend === 'primary' ? 'embeddingPrimary' : 'embeddingFallback';
+  const cache = healthCache[cacheKey];
+
+  // Return cached status if fresh
+  if (cache && (now - cache.lastCheck) < HEALTH_CACHE_TTL) {
+    return cache.status === 'healthy';
+  }
+
+  const url = backend === 'primary' ? EMBEDDING_PRIMARY_URL : EMBEDDING_FALLBACK_URL;
+  if (!url) {
+    healthCache[cacheKey] = { status: 'not_configured', lastCheck: now };
+    return false;
+  }
+
+  try {
+    const response = await fetch(`${url}/v2/health/ready`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(5000)
+    });
+
+    const healthy = response.ok;
+    healthCache[cacheKey] = { status: healthy ? 'healthy' : 'unhealthy', lastCheck: now };
+    return healthy;
+  } catch (error) {
+    healthCache[cacheKey] = { status: 'unavailable', lastCheck: now };
+    return false;
+  }
+}
+
+/**
+ * Call Triton embedding server (KServe V2 protocol)
+ * Returns embeddings for input text(s)
+ */
+async function callTritonEmbedding(url, texts) {
+  // Ensure texts is an array
+  const inputTexts = Array.isArray(texts) ? texts : [texts];
+
+  console.log(`[Embedding] Calling Triton at ${url} with ${inputTexts.length} text(s)`);
+
+  // KServe V2 inference request format for embeddings
+  // Shape must be [batch_size, 1] as model expects [-1, 1]
+  // Data format: each text wrapped in its own array for the 2D shape
+  const response = await fetch(`${url}/v2/models/${EMBEDDING_MODEL}/infer`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      inputs: [
+        {
+          name: 'text',
+          shape: [inputTexts.length, 1],
+          datatype: 'BYTES',
+          data: inputTexts.map(t => [t])
+        }
+      ]
+    }),
+    signal: AbortSignal.timeout(30000)
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Triton embedding error ${response.status}: ${error}`);
+  }
+
+  const data = await response.json();
+
+  // Extract embeddings from Triton response
+  const embeddings = data.outputs?.[0]?.data || data.outputs?.[0]?.contents?.fp32_contents || [];
+
+  // If single text, return single embedding
+  if (!Array.isArray(texts)) {
+    return {
+      embedding: embeddings.slice(0, 1024), // bge-base is 768-dim, bge-large is 1024
+      dimensions: embeddings.length / inputTexts.length
+    };
+  }
+
+  // Return batch embeddings
+  const embeddingDim = embeddings.length / inputTexts.length;
+  const batchEmbeddings = [];
+  for (let i = 0; i < inputTexts.length; i++) {
+    batchEmbeddings.push(embeddings.slice(i * embeddingDim, (i + 1) * embeddingDim));
+  }
+
+  return {
+    embeddings: batchEmbeddings,
+    dimensions: embeddingDim
+  };
+}
+
+/**
+ * Unified embedding function - 2-tier fallback
+ * Priority: Local GPU Triton → VPS CPU Triton
+ */
+async function getEmbeddings(texts, options = {}) {
+  const { forceBackend, skipCache = false } = options;
+  const inputTexts = Array.isArray(texts) ? texts : [texts];
+
+  // Check cache for single text requests
+  if (!skipCache && inputTexts.length === 1) {
+    const cacheKey = getCacheKey(inputTexts[0], { type: 'embedding', model: EMBEDDING_MODEL });
+    const cached = await getFromCache(cacheKey);
+    if (cached) {
+      console.log(`[Embedding] Cache HIT for: ${inputTexts[0].substring(0, 40)}...`);
+      return { ...cached, fromCache: true };
+    }
+  }
+
+  // Force specific backend
+  if (forceBackend === 'primary') {
+    if (!isEmbeddingPrimaryConfigured()) {
+      throw new Error('Primary embedding backend not configured');
+    }
+    const result = await callTritonEmbedding(EMBEDDING_PRIMARY_URL, texts);
+    return { ...result, backend: 'primary (Local GPU)', model: EMBEDDING_MODEL };
+  }
+
+  if (forceBackend === 'fallback') {
+    const result = await callTritonEmbedding(EMBEDDING_FALLBACK_URL, texts);
+    return { ...result, backend: 'fallback (VPS CPU)', model: EMBEDDING_MODEL };
+  }
+
+  // Auto mode: 2-tier fallback
+  // Tier 1: Local GPU Triton
+  if (isEmbeddingPrimaryConfigured()) {
+    const primaryHealthy = await checkEmbeddingHealth('primary');
+    if (primaryHealthy) {
+      try {
+        console.log('[Embedding] Trying Local GPU Triton (Tier 1)...');
+        const result = await callTritonEmbedding(EMBEDDING_PRIMARY_URL, texts);
+
+        // Cache single text results
+        if (!skipCache && inputTexts.length === 1) {
+          const cacheKey = getCacheKey(inputTexts[0], { type: 'embedding', model: EMBEDDING_MODEL });
+          await setInCache(cacheKey, result, 86400); // 24 hour cache for embeddings
+        }
+
+        return { ...result, backend: 'primary (Local GPU)', model: EMBEDDING_MODEL };
+      } catch (error) {
+        console.warn(`[Embedding] Primary failed: ${error.message}`);
+        healthCache.embeddingPrimary = { status: 'unavailable', lastCheck: Date.now() };
+      }
+    } else {
+      console.log('[Embedding] Primary unavailable, skipping Tier 1');
+    }
+  }
+
+  // Tier 2: VPS CPU Triton
+  console.log('[Embedding] Falling back to VPS CPU Triton (Tier 2)...');
+  const result = await callTritonEmbedding(EMBEDDING_FALLBACK_URL, texts);
+
+  // Cache single text results
+  if (!skipCache && inputTexts.length === 1) {
+    const cacheKey = getCacheKey(inputTexts[0], { type: 'embedding', model: EMBEDDING_MODEL });
+    await setInCache(cacheKey, result, 86400);
+  }
+
+  return { ...result, backend: 'fallback (VPS CPU)', model: EMBEDDING_MODEL };
+}
+
+/**
+ * POST /api/ai/embed
+ * Generate embeddings for text(s)
+ *
+ * Body:
+ * {
+ *   "text": "Single text to embed" OR
+ *   "texts": ["Text 1", "Text 2", ...],
+ *   "backend": "auto|primary|fallback" (optional)
+ * }
+ */
+app.post('/api/ai/embed', async (req, res) => {
+  try {
+    const { text, texts, backend } = req.body;
+
+    const input = texts || text;
+    if (!input || (Array.isArray(input) && input.length === 0)) {
+      return res.status(400).json({ error: 'Text or texts array is required' });
+    }
+
+    const isBatch = Array.isArray(input);
+    console.log(`[embed] Generating embeddings for ${isBatch ? input.length + ' texts' : 'single text'}`);
+
+    const result = await getEmbeddings(input, { forceBackend: backend });
+
+    console.log(`[embed] ✓ Embeddings generated via ${result.backend} (${result.dimensions} dimensions)`);
+
+    res.json({
+      success: true,
+      ...(isBatch ? { embeddings: result.embeddings } : { embedding: result.embedding }),
+      dimensions: result.dimensions,
+      model: result.model,
+      backend: result.backend,
+      fromCache: result.fromCache || false
+    });
+
+  } catch (error) {
+    console.error('Embedding error:', error.message);
+    res.status(500).json({
+      error: 'Embedding generation failed',
+      message: error.message
+    });
+  }
+});
+
+/**
  * GET /
  * API info
  */
 app.get('/', (req, res) => {
   res.json({
     name: 'Shared AI Gateway',
-    version: '3.1.0',
-    description: '3-Tier GPU Fallback System with Redis Caching',
+    version: '3.2.0',
+    description: '3-Tier LLM + 2-Tier Embedding GPU Fallback System with Redis Caching',
     backends: {
       'tier1_localGpu': {
         configured: isLocalGpuConfigured(),
@@ -928,13 +1464,29 @@ app.get('/', (req, res) => {
       }
     },
     preference: BACKEND_PREFERENCE,
+    embedding: {
+      'tier1_primary': {
+        configured: isEmbeddingPrimaryConfigured(),
+        model: EMBEDDING_MODEL,
+        url: EMBEDDING_PRIMARY_URL || 'not configured',
+        description: 'Local GPU Triton via Cloudflare tunnel'
+      },
+      'tier2_fallback': {
+        model: EMBEDDING_MODEL,
+        url: EMBEDDING_FALLBACK_URL,
+        description: 'VPS CPU Triton (always available)'
+      }
+    },
     endpoints: {
       'POST /api/ai/generate': 'General text generation',
       'POST /api/ai/tags': 'Generate bookmark tags (keyword or AI)',
       'POST /api/ai/explain-code': 'Explain code snippets',
       'POST /api/ai/flashcard': 'Generate flashcards',
       'POST /api/ai/quiz': 'Generate quiz questions',
-      'GET /health': 'Health check with 3-tier backend status'
+      'POST /api/ai/chat': 'Multi-turn conversational chat (with context)',
+      'POST /api/ai/describe': 'Generate bookmark descriptions',
+      'POST /api/ai/embed': 'Generate text embeddings (single or batch)',
+      'GET /health': 'Health check with backend status'
     },
     usage: {
       backend_param: 'Add "backend": "local-gpu|runpod|local|auto" to force a specific backend',
@@ -1097,12 +1649,14 @@ app.listen(PORT, async () => {
 
   console.log(`
 ╔══════════════════════════════════════════════════════════╗
-║   Shared AI Gateway v3.1 - 3-Tier GPU + Redis Cache      ║
+║   Shared AI Gateway v3.2 - LLM + Embeddings              ║
 ╠══════════════════════════════════════════════════════════╣
 ║   Port: ${PORT.toString().padEnd(48)}║
 ║   Mode: ${BACKEND_PREFERENCE.padEnd(49)}║
 ║   Cache: ${(CACHE_ENABLED ? `Enabled (TTL: ${CACHE_TTL}s)` : 'Disabled').padEnd(48)}║
 ║   Redis: ${REDIS_URL.substring(0, 47).padEnd(47)}║
+╠══════════════════════════════════════════════════════════╣
+║   LLM BACKENDS (3-Tier Fallback)                         ║
 ╠══════════════════════════════════════════════════════════╣
 ║   Tier 1: Local GPU (GTX 1080 via Ollama)                ║
 ║     Configured: ${(isLocalGpuConfigured() ? 'Yes' : 'No').padEnd(40)}║
@@ -1113,6 +1667,15 @@ ${isRunPodConfigured() ? `║     Model: ${RUNPOD_MODEL.substring(0, 45).padEnd(
 ║   Tier 3: VPS CPU (Always Available)                     ║
 ║     URL: ${LOCAL_URL.padEnd(47)}║
 ║     Model: ${LOCAL_MODEL.padEnd(45)}║
+╠══════════════════════════════════════════════════════════╣
+║   EMBEDDING BACKENDS (2-Tier Fallback)                   ║
+╠══════════════════════════════════════════════════════════╣
+║   Tier 1: Local GPU Triton (bge_embeddings)              ║
+║     Configured: ${(isEmbeddingPrimaryConfigured() ? 'Yes' : 'No').padEnd(40)}║
+${isEmbeddingPrimaryConfigured() ? `║     URL: ${EMBEDDING_PRIMARY_URL.substring(0, 47).padEnd(47)}║\n` : ''}╠══════════════════════════════════════════════════════════╣
+║   Tier 2: VPS CPU Triton (Always Available)              ║
+║     URL: ${EMBEDDING_FALLBACK_URL.substring(0, 47).padEnd(47)}║
+║     Model: ${EMBEDDING_MODEL.padEnd(45)}║
 ╚══════════════════════════════════════════════════════════╝
   `);
 });
