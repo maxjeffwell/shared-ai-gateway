@@ -82,6 +82,11 @@ const PORT = process.env.PORT || 8002;
 const LOCAL_GPU_URL = process.env.LOCAL_GPU_URL; // e.g., https://gpu.yourdomain.com
 const LOCAL_GPU_MODEL = process.env.LOCAL_GPU_MODEL || 'llama3.1:8b-instruct-q4_K_M';
 
+// Lens Loop Observability - proxy for LLM tracing (optional)
+// When enabled, routes requests through Lens Loop for observability
+const LENS_LOOP_PROXY = process.env.LENS_LOOP_PROXY; // e.g., http://host.docker.internal:31300
+const LENS_LOOP_PROJECT = process.env.LENS_LOOP_PROJECT || 'lens-loop-project';
+
 // Tier 2: RunPod GPU - Llama 3.1 8B on RTX 4090 (cloud, serverless)
 const RUNPOD_API_KEY = process.env.RUNPOD_API_KEY;
 const RUNPOD_ENDPOINT_ID = process.env.RUNPOD_ENDPOINT_ID;
@@ -125,6 +130,13 @@ const INFERENCE_URL = process.env.INFERENCE_URL || LOCAL_URL;
  */
 function isLocalGpuConfigured() {
   return !!LOCAL_GPU_URL;
+}
+
+/**
+ * Check if Lens Loop observability proxy is configured
+ */
+function isLensLoopConfigured() {
+  return !!LENS_LOOP_PROXY;
 }
 
 /**
@@ -187,7 +199,8 @@ async function checkBackendHealth(backend) {
 
 /**
  * Call Local GPU (Ollama) via Cloudflare tunnel
- * Uses OpenAI-compatible chat format
+ * Routes through Lens Loop proxy when configured for LLM observability
+ * Uses OpenAI-compatible chat format when routed through Lens Loop
  */
 async function callLocalGpu(messages, options = {}) {
   if (!isLocalGpuConfigured()) {
@@ -196,6 +209,52 @@ async function callLocalGpu(messages, options = {}) {
 
   const { maxTokens = 1024, temperature = 0.7 } = options;
 
+  // Route through Lens Loop for observability if configured
+  if (isLensLoopConfigured()) {
+    console.log(`[LocalGPU] Calling ${LOCAL_GPU_MODEL} via Lens Loop proxy`);
+
+    // Lens Loop expects OpenAI-compatible format
+    // URL format: http://<proxy>/openai/<target>/v1/chat/completions
+    const targetUrl = LOCAL_GPU_URL.replace(/^https?:\/\//, '');
+    const lensLoopUrl = `${LENS_LOOP_PROXY}/openai/http/${targetUrl}/v1/chat/completions`;
+
+    const response = await fetch(lensLoopUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Loop-Project': LENS_LOOP_PROJECT
+      },
+      body: JSON.stringify({
+        model: LOCAL_GPU_MODEL,
+        messages,
+        max_tokens: maxTokens,
+        temperature
+      }),
+      signal: AbortSignal.timeout(120000)
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      throw new Error(`Local GPU (via Lens Loop) error ${response.status}: ${error}`);
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content || '';
+
+    console.log(`[LocalGPU] ✓ Response via Lens Loop (${content.length} chars) - traced in project: ${LENS_LOOP_PROJECT}`);
+
+    return {
+      response: content.trim(),
+      model: LOCAL_GPU_MODEL,
+      backend: 'local-gpu (traced)',
+      usage: data.usage || {
+        prompt_tokens: 0,
+        completion_tokens: 0
+      }
+    };
+  }
+
+  // Direct Ollama API call (no observability)
   console.log(`[LocalGPU] Calling ${LOCAL_GPU_MODEL} via Ollama`);
 
   const response = await fetch(`${LOCAL_GPU_URL}/api/chat`, {
@@ -503,6 +562,14 @@ app.get('/health', async (req, res) => {
     gateway: 'healthy',
     preference: BACKEND_PREFERENCE,
     cache: cacheStatus,
+    observability: {
+      lensLoop: {
+        enabled: isLensLoopConfigured(),
+        proxy: LENS_LOOP_PROXY || 'not configured',
+        project: LENS_LOOP_PROJECT,
+        description: 'LLM request tracing and analytics'
+      }
+    },
     backends: {
       // Tier 1: Local GPU (your GTX 1080)
       localGpu: {
@@ -1649,13 +1716,17 @@ app.listen(PORT, async () => {
 
   console.log(`
 ╔══════════════════════════════════════════════════════════╗
-║   Shared AI Gateway v3.2 - LLM + Embeddings              ║
+║   Shared AI Gateway v3.3 - LLM + Embeddings + Tracing    ║
 ╠══════════════════════════════════════════════════════════╣
 ║   Port: ${PORT.toString().padEnd(48)}║
 ║   Mode: ${BACKEND_PREFERENCE.padEnd(49)}║
 ║   Cache: ${(CACHE_ENABLED ? `Enabled (TTL: ${CACHE_TTL}s)` : 'Disabled').padEnd(48)}║
 ║   Redis: ${REDIS_URL.substring(0, 47).padEnd(47)}║
 ╠══════════════════════════════════════════════════════════╣
+║   OBSERVABILITY (Lens Loop)                              ║
+╠══════════════════════════════════════════════════════════╣
+║   Tracing: ${(isLensLoopConfigured() ? 'Enabled ✓' : 'Disabled').padEnd(45)}║
+${isLensLoopConfigured() ? `║   Proxy: ${LENS_LOOP_PROXY.substring(0, 47).padEnd(47)}║\n║   Project: ${LENS_LOOP_PROJECT.padEnd(45)}║\n` : ''}╠══════════════════════════════════════════════════════════╣
 ║   LLM BACKENDS (3-Tier Fallback)                         ║
 ╠══════════════════════════════════════════════════════════╣
 ║   Tier 1: Local GPU (GTX 1080 via Ollama)                ║
