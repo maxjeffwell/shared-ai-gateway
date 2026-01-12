@@ -5,6 +5,7 @@ import fetch from 'node-fetch';
 import { createHash } from 'crypto';
 import Redis from 'ioredis';
 import promClient from 'prom-client';
+import Anthropic from '@anthropic-ai/sdk';
 
 dotenv.config();
 
@@ -151,11 +152,26 @@ const EMBEDDING_PRIMARY_URL = process.env.EMBEDDING_PRIMARY_URL; // e.g., https:
 const EMBEDDING_FALLBACK_URL = process.env.EMBEDDING_FALLBACK_URL || 'http://triton-embeddings:8000';
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'bge_embeddings';
 
+// =============================================================================
+// ANTHROPIC (CLAUDE) CONFIGURATION - Premium tier for complex reasoning
+// =============================================================================
+// Use Claude for tasks requiring deep reasoning, K8s analysis, complex debugging
+// =============================================================================
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
+
+// Initialize Anthropic client
+let anthropicClient = null;
+if (ANTHROPIC_API_KEY) {
+  anthropicClient = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+}
+
 // Health check cache (avoid hammering backends)
 const healthCache = {
   localGpu: { status: 'unknown', lastCheck: 0 },
   runpod: { status: 'unknown', lastCheck: 0 },
   local: { status: 'unknown', lastCheck: 0 },
+  anthropic: { status: 'unknown', lastCheck: 0 },
   embeddingPrimary: { status: 'unknown', lastCheck: 0 },
   embeddingFallback: { status: 'unknown', lastCheck: 0 }
 };
@@ -186,6 +202,13 @@ function isRunPodConfigured() {
 }
 
 /**
+ * Check if Anthropic (Claude) is configured
+ */
+function isAnthropicConfigured() {
+  return !!ANTHROPIC_API_KEY && !!anthropicClient;
+}
+
+/**
  * Quick health check with caching (avoids hammering backends)
  */
 async function checkBackendHealth(backend) {
@@ -212,6 +235,11 @@ async function checkBackendHealth(backend) {
       case 'local':
         url = `${LOCAL_URL}/health`;
         break;
+      case 'anthropic':
+        // Anthropic doesn't have a health endpoint, just check if configured
+        if (!isAnthropicConfigured()) return false;
+        healthCache[backend] = { status: 'healthy', lastCheck: now };
+        return true;
       default:
         return false;
     }
@@ -419,6 +447,56 @@ async function callRunPod(messages, options = {}) {
 }
 
 /**
+ * Call Anthropic Claude API
+ * Best for complex reasoning, K8s analysis, debugging
+ */
+async function callAnthropic(messages, options = {}) {
+  if (!isAnthropicConfigured()) {
+    throw new Error('Anthropic not configured');
+  }
+
+  const { maxTokens = 1024, temperature = 0.7 } = options;
+
+  // Extract system message if present
+  let systemPrompt = '';
+  const chatMessages = [];
+
+  for (const msg of messages) {
+    if (msg.role === 'system') {
+      systemPrompt = msg.content;
+    } else {
+      chatMessages.push({
+        role: msg.role,
+        content: msg.content
+      });
+    }
+  }
+
+  console.log(`[Anthropic] Calling ${ANTHROPIC_MODEL} with ${chatMessages.length} messages`);
+
+  const response = await anthropicClient.messages.create({
+    model: ANTHROPIC_MODEL,
+    max_tokens: maxTokens,
+    ...(systemPrompt && { system: systemPrompt }),
+    messages: chatMessages
+  });
+
+  const content = response.content[0]?.text || '';
+
+  console.log(`[Anthropic] ✓ Response received (${content.length} chars)`);
+
+  return {
+    response: content.trim(),
+    model: ANTHROPIC_MODEL,
+    backend: 'anthropic',
+    usage: {
+      prompt_tokens: response.usage?.input_tokens,
+      completion_tokens: response.usage?.output_tokens
+    }
+  };
+}
+
+/**
  * Call local Llama 3.2 3B backend (llama.cpp server - OpenAI compatible)
  */
 async function callLocal(messages, options = {}) {
@@ -513,6 +591,13 @@ async function inference(prompt, options = {}) {
       throw new Error('RunPod requested but not configured');
     }
     return instrumentedCall('runpod', () => callRunPod(messages, { maxTokens, temperature }));
+  }
+
+  if (backend === 'anthropic' || backend === 'claude') {
+    if (!isAnthropicConfigured()) {
+      throw new Error('Anthropic requested but not configured');
+    }
+    return instrumentedCall('anthropic', () => callAnthropic(messages, { maxTokens, temperature }));
   }
 
   if (backend === 'local') {
@@ -787,6 +872,14 @@ app.get('/health', async (req, res) => {
     health.activeEmbeddingBackend = 'none';
     health.activeEmbeddingDescription = 'No embedding backends available!';
   }
+
+  // Add Anthropic (Claude) status to health check
+  health.anthropic = {
+    configured: isAnthropicConfigured(),
+    model: isAnthropicConfigured() ? ANTHROPIC_MODEL : null,
+    status: isAnthropicConfigured() ? 'ready' : 'not_configured',
+    description: 'Claude API for complex reasoning (K8s analysis, debugging)'
+  };
 
   // Determine active backend (what would be used for next request)
   if (health.backends.localGpu.status === 'healthy') {
@@ -1154,6 +1247,13 @@ async function chatInference(messages, options = {}) {
       throw new Error('RunPod requested but not configured');
     }
     return instrumentedCall('runpod', () => callRunPod(messages, { maxTokens, temperature }), 'chat');
+  }
+
+  if (backend === 'anthropic' || backend === 'claude') {
+    if (!isAnthropicConfigured()) {
+      throw new Error('Anthropic requested but not configured');
+    }
+    return instrumentedCall('anthropic', () => callAnthropic(messages, { maxTokens, temperature }), 'chat');
   }
 
   if (backend === 'local') {
@@ -1599,8 +1699,8 @@ app.post('/api/ai/embed', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'Shared AI Gateway',
-    version: '3.4.0',
-    description: '3-Tier LLM + 2-Tier Embedding GPU Fallback System with Redis Caching',
+    version: '3.5.0',
+    description: '3-Tier LLM + 2-Tier Embedding GPU Fallback System with Anthropic Claude + Redis Caching',
     backends: {
       'tier1_localGpu': {
         configured: isLocalGpuConfigured(),
@@ -1615,6 +1715,11 @@ app.get('/', (req, res) => {
       'tier3_local': {
         model: LOCAL_MODEL,
         description: 'Llama 3.2 3B on VPS CPU (always available fallback)'
+      },
+      'anthropic': {
+        configured: isAnthropicConfigured(),
+        model: isAnthropicConfigured() ? ANTHROPIC_MODEL : null,
+        description: 'Claude API for complex reasoning (request with backend: "anthropic")'
       }
     },
     preference: BACKEND_PREFERENCE,
@@ -1644,8 +1749,9 @@ app.get('/', (req, res) => {
       'GET /metrics': 'Prometheus metrics endpoint'
     },
     usage: {
-      backend_param: 'Add "backend": "local-gpu|runpod|local|auto" to force a specific backend',
-      auto_mode: 'Default "auto" tries backends in order: local-gpu → runpod → local'
+      backend_param: 'Add "backend": "local-gpu|runpod|local|anthropic|auto" to force a specific backend',
+      auto_mode: 'Default "auto" tries backends in order: local-gpu → runpod → local',
+      anthropic_mode: 'Use "backend": "anthropic" or "claude" for complex reasoning tasks (K8s analysis, debugging)'
     }
   });
 });
@@ -1804,7 +1910,7 @@ app.listen(PORT, async () => {
 
   console.log(`
 ╔══════════════════════════════════════════════════════════╗
-║   Shared AI Gateway v3.4 - LLM + Embeddings + Metrics    ║
+║   Shared AI Gateway v3.5 - LLM + Embeddings + Claude     ║
 ╠══════════════════════════════════════════════════════════╣
 ║   Port: ${PORT.toString().padEnd(48)}║
 ║   Mode: ${BACKEND_PREFERENCE.padEnd(49)}║
@@ -1827,6 +1933,10 @@ ${isRunPodConfigured() ? `║     Model: ${RUNPOD_MODEL.substring(0, 45).padEnd(
 ║     URL: ${LOCAL_URL.padEnd(47)}║
 ║     Model: ${LOCAL_MODEL.padEnd(45)}║
 ╠══════════════════════════════════════════════════════════╣
+║   ANTHROPIC (Claude - Premium Reasoning)                 ║
+╠══════════════════════════════════════════════════════════╣
+║   Configured: ${(isAnthropicConfigured() ? 'Yes ✓' : 'No').padEnd(42)}║
+${isAnthropicConfigured() ? `║   Model: ${ANTHROPIC_MODEL.padEnd(47)}║\n` : ''}╠══════════════════════════════════════════════════════════╣
 ║   EMBEDDING BACKENDS (2-Tier Fallback)                   ║
 ╠══════════════════════════════════════════════════════════╣
 ║   Tier 1: Local GPU Triton (bge_embeddings)              ║
