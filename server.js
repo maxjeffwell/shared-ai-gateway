@@ -4,8 +4,45 @@ import dotenv from 'dotenv';
 import fetch from 'node-fetch';
 import { createHash } from 'crypto';
 import Redis from 'ioredis';
+import promClient from 'prom-client';
 
 dotenv.config();
+
+// =============================================================================
+// PROMETHEUS METRICS
+// =============================================================================
+promClient.collectDefaultMetrics({ prefix: 'gateway_' });
+
+const requestCounter = new promClient.Counter({
+  name: 'gateway_requests_total',
+  help: 'Total requests by backend and endpoint',
+  labelNames: ['backend', 'endpoint', 'status']
+});
+
+const requestDuration = new promClient.Histogram({
+  name: 'gateway_request_duration_seconds',
+  help: 'Request duration by backend',
+  labelNames: ['backend', 'endpoint'],
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 30, 60]
+});
+
+const fallbackCounter = new promClient.Counter({
+  name: 'gateway_fallback_total',
+  help: 'Fallback events from one tier to another',
+  labelNames: ['from_tier', 'to_tier', 'reason']
+});
+
+const cacheCounter = new promClient.Counter({
+  name: 'gateway_cache_total',
+  help: 'Cache hits and misses',
+  labelNames: ['result']
+});
+
+const backendGauge = new promClient.Gauge({
+  name: 'gateway_backend_healthy',
+  help: 'Backend health status (1=healthy, 0=unhealthy)',
+  labelNames: ['backend']
+});
 
 // =============================================================================
 // REDIS CACHE CONFIGURATION
@@ -46,8 +83,10 @@ async function getFromCache(key) {
     const cached = await redis.get(key);
     if (cached) {
       console.log(`[Cache] HIT: ${key.substring(0, 20)}...`);
+      cacheCounter.inc({ result: 'hit' });
       return JSON.parse(cached);
     }
+    cacheCounter.inc({ result: 'miss' });
   } catch (err) {
     console.warn('[Cache] Get error:', err.message);
   }
@@ -408,6 +447,23 @@ async function callLocal(messages, options = {}) {
 }
 
 /**
+ * Instrumented backend call wrapper - tracks metrics
+ */
+async function instrumentedCall(backendName, callFn, endpoint = 'inference') {
+  const end = requestDuration.startTimer({ backend: backendName, endpoint });
+  try {
+    const result = await callFn();
+    requestCounter.inc({ backend: backendName, endpoint, status: 'success' });
+    end();
+    return result;
+  } catch (error) {
+    requestCounter.inc({ backend: backendName, endpoint, status: 'error' });
+    end();
+    throw error;
+  }
+}
+
+/**
  * Unified inference function - 3-tier fallback system with Redis caching
  * Priority: Local GPU (free) → RunPod GPU (paid) → VPS CPU (slow but reliable)
  */
@@ -438,28 +494,29 @@ async function inference(prompt, options = {}) {
     if (!isLocalGpuConfigured()) {
       throw new Error('Local GPU requested but not configured');
     }
-    return callLocalGpu(messages, { maxTokens, temperature });
+    return instrumentedCall('marmoset-gpu', () => callLocalGpu(messages, { maxTokens, temperature }));
   }
 
   if (backend === 'runpod') {
     if (!isRunPodConfigured()) {
       throw new Error('RunPod requested but not configured');
     }
-    return callRunPod(messages, { maxTokens, temperature });
+    return instrumentedCall('runpod', () => callRunPod(messages, { maxTokens, temperature }));
   }
 
   if (backend === 'local') {
-    return callLocal(messages, { maxTokens, temperature });
+    return instrumentedCall('vps-cpu', () => callLocal(messages, { maxTokens, temperature }));
   }
 
   // Auto mode: smart 3-tier fallback with health checks
   // Tier 1: Local GPU (free, fastest when available)
   if (isLocalGpuConfigured()) {
     const localGpuHealthy = await checkBackendHealth('localGpu');
+    backendGauge.set({ backend: 'marmoset-gpu' }, localGpuHealthy ? 1 : 0);
     if (localGpuHealthy) {
       try {
         console.log('[auto] Trying Local GPU (Tier 1)...');
-        const gpuResult = await callLocalGpu(messages, { maxTokens, temperature });
+        const gpuResult = await instrumentedCall('marmoset-gpu', () => callLocalGpu(messages, { maxTokens, temperature }));
         // Cache the result for low-temperature requests
         if (!skipCache && temperature <= 0.5) {
           const cacheKey = getCacheKey(prompt, { systemPrompt, maxTokens, backend });
@@ -468,11 +525,13 @@ async function inference(prompt, options = {}) {
         return gpuResult;
       } catch (error) {
         console.warn(`[auto] Local GPU failed: ${error.message}`);
+        fallbackCounter.inc({ from_tier: 'marmoset-gpu', to_tier: 'runpod', reason: 'error' });
         // Mark as unhealthy to skip on next request
         healthCache.localGpu = { status: 'unavailable', lastCheck: Date.now() };
       }
     } else {
       console.log('[auto] Local GPU unavailable, skipping Tier 1');
+      fallbackCounter.inc({ from_tier: 'marmoset-gpu', to_tier: 'runpod', reason: 'unhealthy' });
     }
   }
 
@@ -480,7 +539,7 @@ async function inference(prompt, options = {}) {
   if (isRunPodConfigured()) {
     try {
       console.log('[auto] Trying RunPod GPU (Tier 2)...');
-      const runpodResult = await callRunPod(messages, { maxTokens, temperature });
+      const runpodResult = await instrumentedCall('runpod', () => callRunPod(messages, { maxTokens, temperature }));
       // Cache the result for low-temperature requests
       if (!skipCache && temperature <= 0.5) {
         const cacheKey = getCacheKey(prompt, { systemPrompt, maxTokens, backend });
@@ -489,12 +548,13 @@ async function inference(prompt, options = {}) {
       return runpodResult;
     } catch (error) {
       console.warn(`[auto] RunPod failed: ${error.message}`);
+      fallbackCounter.inc({ from_tier: 'runpod', to_tier: 'vps-cpu', reason: 'error' });
     }
   }
 
   // Tier 3: VPS CPU (always available fallback)
   console.log('[auto] Falling back to VPS CPU (Tier 3)...');
-  const localResult = await callLocal(messages, { maxTokens, temperature });
+  const localResult = await instrumentedCall('vps-cpu', () => callLocal(messages, { maxTokens, temperature }));
 
   // Cache the result for low-temperature requests
   if (!skipCache && temperature <= 0.5) {
@@ -541,6 +601,14 @@ Given a URL and title, generate a 1-2 sentence description that captures what th
 Focus on being accurate and useful. If you're unsure, describe what you can infer from the title and URL.
 Output only the description, nothing else.`
 };
+
+/**
+ * Prometheus metrics endpoint
+ */
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', promClient.register.contentType);
+  res.end(await promClient.register.metrics());
+});
 
 /**
  * Health check endpoint - shows 3-tier backend status
@@ -1067,32 +1135,36 @@ async function chatInference(messages, options = {}) {
     if (!isLocalGpuConfigured()) {
       throw new Error('Local GPU requested but not configured');
     }
-    return callLocalGpu(messages, { maxTokens, temperature });
+    return instrumentedCall('marmoset-gpu', () => callLocalGpu(messages, { maxTokens, temperature }), 'chat');
   }
 
   if (backend === 'runpod') {
     if (!isRunPodConfigured()) {
       throw new Error('RunPod requested but not configured');
     }
-    return callRunPod(messages, { maxTokens, temperature });
+    return instrumentedCall('runpod', () => callRunPod(messages, { maxTokens, temperature }), 'chat');
   }
 
   if (backend === 'local') {
-    return callLocal(messages, { maxTokens, temperature });
+    return instrumentedCall('vps-cpu', () => callLocal(messages, { maxTokens, temperature }), 'chat');
   }
 
   // Auto mode: smart 3-tier fallback with health checks
   // Tier 1: Local GPU (free, fastest when available)
   if (isLocalGpuConfigured()) {
     const localGpuHealthy = await checkBackendHealth('localGpu');
+    backendGauge.set({ backend: 'marmoset-gpu' }, localGpuHealthy ? 1 : 0);
     if (localGpuHealthy) {
       try {
         console.log('[chat-auto] Trying Local GPU (Tier 1)...');
-        return await callLocalGpu(messages, { maxTokens, temperature });
+        return await instrumentedCall('marmoset-gpu', () => callLocalGpu(messages, { maxTokens, temperature }), 'chat');
       } catch (error) {
         console.warn(`[chat-auto] Local GPU failed: ${error.message}`);
+        fallbackCounter.inc({ from_tier: 'marmoset-gpu', to_tier: 'runpod', reason: 'error' });
         healthCache.localGpu = { status: 'unavailable', lastCheck: Date.now() };
       }
+    } else {
+      fallbackCounter.inc({ from_tier: 'marmoset-gpu', to_tier: 'runpod', reason: 'unhealthy' });
     }
   }
 
@@ -1100,15 +1172,16 @@ async function chatInference(messages, options = {}) {
   if (isRunPodConfigured()) {
     try {
       console.log('[chat-auto] Trying RunPod GPU (Tier 2)...');
-      return await callRunPod(messages, { maxTokens, temperature });
+      return await instrumentedCall('runpod', () => callRunPod(messages, { maxTokens, temperature }), 'chat');
     } catch (error) {
       console.warn(`[chat-auto] RunPod failed: ${error.message}`);
+      fallbackCounter.inc({ from_tier: 'runpod', to_tier: 'vps-cpu', reason: 'error' });
     }
   }
 
   // Tier 3: VPS CPU (always available fallback)
   console.log('[chat-auto] Falling back to VPS CPU (Tier 3)...');
-  return await callLocal(messages, { maxTokens, temperature });
+  return await instrumentedCall('vps-cpu', () => callLocal(messages, { maxTokens, temperature }), 'chat');
 }
 
 /**
@@ -1413,12 +1486,12 @@ async function getEmbeddings(texts, options = {}) {
     if (!isEmbeddingPrimaryConfigured()) {
       throw new Error('Primary embedding backend not configured');
     }
-    const result = await callTritonEmbedding(EMBEDDING_PRIMARY_URL, texts);
+    const result = await instrumentedCall('marmoset-gpu-embed', () => callTritonEmbedding(EMBEDDING_PRIMARY_URL, texts), 'embedding');
     return { ...result, backend: 'primary (Local GPU)', model: EMBEDDING_MODEL };
   }
 
   if (forceBackend === 'fallback') {
-    const result = await callTritonEmbedding(EMBEDDING_FALLBACK_URL, texts);
+    const result = await instrumentedCall('vps-cpu-embed', () => callTritonEmbedding(EMBEDDING_FALLBACK_URL, texts), 'embedding');
     return { ...result, backend: 'fallback (VPS CPU)', model: EMBEDDING_MODEL };
   }
 
@@ -1426,10 +1499,11 @@ async function getEmbeddings(texts, options = {}) {
   // Tier 1: Local GPU Triton
   if (isEmbeddingPrimaryConfigured()) {
     const primaryHealthy = await checkEmbeddingHealth('primary');
+    backendGauge.set({ backend: 'marmoset-gpu-embed' }, primaryHealthy ? 1 : 0);
     if (primaryHealthy) {
       try {
         console.log('[Embedding] Trying Local GPU Triton (Tier 1)...');
-        const result = await callTritonEmbedding(EMBEDDING_PRIMARY_URL, texts);
+        const result = await instrumentedCall('marmoset-gpu-embed', () => callTritonEmbedding(EMBEDDING_PRIMARY_URL, texts), 'embedding');
 
         // Cache single text results
         if (!skipCache && inputTexts.length === 1) {
@@ -1440,16 +1514,18 @@ async function getEmbeddings(texts, options = {}) {
         return { ...result, backend: 'primary (Local GPU)', model: EMBEDDING_MODEL };
       } catch (error) {
         console.warn(`[Embedding] Primary failed: ${error.message}`);
+        fallbackCounter.inc({ from_tier: 'marmoset-gpu-embed', to_tier: 'vps-cpu-embed', reason: 'error' });
         healthCache.embeddingPrimary = { status: 'unavailable', lastCheck: Date.now() };
       }
     } else {
       console.log('[Embedding] Primary unavailable, skipping Tier 1');
+      fallbackCounter.inc({ from_tier: 'marmoset-gpu-embed', to_tier: 'vps-cpu-embed', reason: 'unhealthy' });
     }
   }
 
   // Tier 2: VPS CPU Triton
   console.log('[Embedding] Falling back to VPS CPU Triton (Tier 2)...');
-  const result = await callTritonEmbedding(EMBEDDING_FALLBACK_URL, texts);
+  const result = await instrumentedCall('vps-cpu-embed', () => callTritonEmbedding(EMBEDDING_FALLBACK_URL, texts), 'embedding');
 
   // Cache single text results
   if (!skipCache && inputTexts.length === 1) {
@@ -1512,7 +1588,7 @@ app.post('/api/ai/embed', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'Shared AI Gateway',
-    version: '3.2.0',
+    version: '3.4.0',
     description: '3-Tier LLM + 2-Tier Embedding GPU Fallback System with Redis Caching',
     backends: {
       'tier1_localGpu': {
@@ -1553,7 +1629,8 @@ app.get('/', (req, res) => {
       'POST /api/ai/chat': 'Multi-turn conversational chat (with context)',
       'POST /api/ai/describe': 'Generate bookmark descriptions',
       'POST /api/ai/embed': 'Generate text embeddings (single or batch)',
-      'GET /health': 'Health check with backend status'
+      'GET /health': 'Health check with backend status',
+      'GET /metrics': 'Prometheus metrics endpoint'
     },
     usage: {
       backend_param: 'Add "backend": "local-gpu|runpod|local|auto" to force a specific backend',
@@ -1716,7 +1793,7 @@ app.listen(PORT, async () => {
 
   console.log(`
 ╔══════════════════════════════════════════════════════════╗
-║   Shared AI Gateway v3.3 - LLM + Embeddings + Tracing    ║
+║   Shared AI Gateway v3.4 - LLM + Embeddings + Metrics    ║
 ╠══════════════════════════════════════════════════════════╣
 ║   Port: ${PORT.toString().padEnd(48)}║
 ║   Mode: ${BACKEND_PREFERENCE.padEnd(49)}║
