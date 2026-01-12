@@ -160,11 +160,14 @@ const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'bge_embeddings';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
 
-// Initialize Anthropic client
+// Initialize Anthropic client (native SDK)
 let anthropicClient = null;
 if (ANTHROPIC_API_KEY) {
   anthropicClient = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 }
+
+// Note: Lens Loop is designed for OpenAI and doesn't properly support Anthropic
+// (forwards over HTTP instead of HTTPS). Claude calls use native Anthropic SDK.
 
 // Health check cache (avoid hammering backends)
 const healthCache = {
@@ -449,12 +452,14 @@ async function callRunPod(messages, options = {}) {
 /**
  * Call Anthropic Claude API
  * Best for complex reasoning, K8s analysis, debugging
+ * Uses OpenAI SDK via Lens Loop when enabled for observability
  */
 async function callAnthropic(messages, options = {}) {
   if (!isAnthropicConfigured()) {
     throw new Error('Anthropic not configured');
   }
 
+  const startTime = Date.now();
   const { maxTokens = 1024, temperature = 0.7 } = options;
 
   // Extract system message if present
@@ -473,7 +478,9 @@ async function callAnthropic(messages, options = {}) {
   }
 
   console.log(`[Anthropic] Calling ${ANTHROPIC_MODEL} with ${chatMessages.length} messages`);
+  console.log(`[Anthropic] System prompt (first 1000 chars): ${systemPrompt.substring(0, 1000)}...`);
 
+  // Use native Anthropic SDK
   const response = await anthropicClient.messages.create({
     model: ANTHROPIC_MODEL,
     max_tokens: maxTokens,
@@ -482,17 +489,20 @@ async function callAnthropic(messages, options = {}) {
   });
 
   const content = response.content[0]?.text || '';
+  const usage = {
+    prompt_tokens: response.usage?.input_tokens,
+    completion_tokens: response.usage?.output_tokens
+  };
 
-  console.log(`[Anthropic] ✓ Response received (${content.length} chars)`);
+  const durationMs = Date.now() - startTime;
+
+  console.log(`[Anthropic] ✓ Response received (${content.length} chars) in ${durationMs}ms`);
 
   return {
     response: content.trim(),
     model: ANTHROPIC_MODEL,
     backend: 'anthropic',
-    usage: {
-      prompt_tokens: response.usage?.input_tokens,
-      completion_tokens: response.usage?.output_tokens
-    }
+    usage
   };
 }
 
