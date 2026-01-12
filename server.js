@@ -248,52 +248,63 @@ async function callLocalGpu(messages, options = {}) {
 
   const { maxTokens = 1024, temperature = 0.7 } = options;
 
-  // Route through Lens Loop for observability if configured
+  // Try Lens Loop for observability if configured (graceful fallback to direct if unavailable)
   if (isLensLoopConfigured()) {
-    console.log(`[LocalGPU] Calling ${LOCAL_GPU_MODEL} via Lens Loop proxy`);
+    try {
+      console.log(`[LocalGPU] Calling ${LOCAL_GPU_MODEL} via Lens Loop proxy`);
 
-    // Lens Loop expects OpenAI-compatible format
-    // URL format: http://<proxy>/openai/<target>/v1/chat/completions
-    const targetUrl = LOCAL_GPU_URL.replace(/^https?:\/\//, '');
-    const lensLoopUrl = `${LENS_LOOP_PROXY}/openai/http/${targetUrl}/v1/chat/completions`;
+      // Lens Loop expects OpenAI-compatible format
+      // URL format: http://<proxy>/openai/<target>/v1/chat/completions
+      const targetUrl = LOCAL_GPU_URL.replace(/^https?:\/\//, '');
+      const lensLoopUrl = `${LENS_LOOP_PROXY}/openai/http/${targetUrl}/v1/chat/completions`;
 
-    const response = await fetch(lensLoopUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Loop-Project': LENS_LOOP_PROJECT
-      },
-      body: JSON.stringify({
-        model: LOCAL_GPU_MODEL,
-        messages,
-        max_tokens: maxTokens,
-        temperature
-      }),
-      signal: AbortSignal.timeout(120000)
-    });
+      const response = await fetch(lensLoopUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Loop-Project': LENS_LOOP_PROJECT
+        },
+        body: JSON.stringify({
+          model: LOCAL_GPU_MODEL,
+          messages,
+          max_tokens: maxTokens,
+          temperature
+        }),
+        signal: AbortSignal.timeout(10000) // 10s timeout for proxy (fail fast)
+      });
 
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Local GPU (via Lens Loop) error ${response.status}: ${error}`);
-    }
+      if (!response.ok) {
+        const error = await response.text();
+        // Check if it's a proxy unavailable error (502, 503, connection refused)
+        if (response.status === 502 || response.status === 503 || response.status === 504) {
+          console.log(`[LocalGPU] Lens Loop proxy unavailable (${response.status}), falling back to direct GPU call`);
+          // Fall through to direct call below
+        } else {
+          throw new Error(`Local GPU (via Lens Loop) error ${response.status}: ${error}`);
+        }
+      } else {
+        const data = await response.json();
+        const content = data.choices?.[0]?.message?.content || '';
 
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content || '';
+        console.log(`[LocalGPU] ✓ Response via Lens Loop (${content.length} chars) - traced in project: ${LENS_LOOP_PROJECT}`);
 
-    console.log(`[LocalGPU] ✓ Response via Lens Loop (${content.length} chars) - traced in project: ${LENS_LOOP_PROJECT}`);
-
-    return {
-      response: content.trim(),
-      model: LOCAL_GPU_MODEL,
-      backend: 'local-gpu (traced)',
-      usage: data.usage || {
-        prompt_tokens: 0,
-        completion_tokens: 0
+        return {
+          response: content.trim(),
+          model: LOCAL_GPU_MODEL,
+          backend: 'local-gpu (traced)',
+          usage: data.usage || {
+            prompt_tokens: 0,
+            completion_tokens: 0
+          }
+        };
       }
-    };
+    } catch (lensLoopError) {
+      // Network errors, timeouts, etc. - fall back to direct call
+      console.log(`[LocalGPU] Lens Loop proxy error: ${lensLoopError.message}, falling back to direct GPU call`);
+    }
   }
 
-  // Direct Ollama API call (no observability)
+  // Direct Ollama API call (no observability, or fallback when Lens Loop unavailable)
   console.log(`[LocalGPU] Calling ${LOCAL_GPU_MODEL} via Ollama`);
 
   const response = await fetch(`${LOCAL_GPU_URL}/api/chat`, {
