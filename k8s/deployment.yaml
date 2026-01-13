@@ -1,19 +1,11 @@
 ---
 # Shared AI Gateway - Node.js Express server that routes AI requests
 # Provides fallback chain: Groq -> Local GPU -> Anthropic
-apiVersion: v1
-kind: Secret
-metadata:
-  name: ai-gateway-credentials
-  labels:
-    app: shared-ai-gateway
-    component: ai-gateway
-    tier: ai
-type: Opaque
-stringData:
-  # Replace with actual values or use kubectl create secret
-  GROQ_API_KEY: "placeholder-replace-me"
-  ANTHROPIC_API_KEY: "placeholder-replace-me"
+#
+# SECRET SETUP (run before applying this file):
+# kubectl create secret generic ai-gateway-credentials \
+#   --from-literal=GROQ_API_KEY=<your-groq-key> \
+#   --from-literal=ANTHROPIC_API_KEY=<your-anthropic-key>
 ---
 apiVersion: apps/v1
 kind: Deployment
