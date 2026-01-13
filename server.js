@@ -176,12 +176,36 @@ if (ANTHROPIC_API_KEY) {
 // OpenAI client for Claude via Lens Loop → LiteLLM (initialized after function defs)
 let openaiClientForClaude = null;
 
+// =============================================================================
+// GROQ CONFIGURATION - Free tier for education/code apps
+// =============================================================================
+// Fast inference on Llama models, used for code-talk, educationelly apps
+// OpenAI-compatible API
+// =============================================================================
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.1-70b-versatile';
+const GROQ_API_URL = 'https://api.groq.com/openai/v1';
+
+// Apps that should use Groq instead of other backends
+const GROQ_APPS = ['code-talk', 'educationelly', 'educationelly-graphql'];
+
+// Initialize Groq client (OpenAI-compatible)
+let groqClient = null;
+if (GROQ_API_KEY) {
+  groqClient = new OpenAI({
+    apiKey: GROQ_API_KEY,
+    baseURL: GROQ_API_URL
+  });
+  console.log(`[Groq] Initialized with model: ${GROQ_MODEL}`);
+}
+
 // Health check cache (avoid hammering backends)
 const healthCache = {
   localGpu: { status: 'unknown', lastCheck: 0 },
   runpod: { status: 'unknown', lastCheck: 0 },
   local: { status: 'unknown', lastCheck: 0 },
   anthropic: { status: 'unknown', lastCheck: 0 },
+  groq: { status: 'unknown', lastCheck: 0 },
   embeddingPrimary: { status: 'unknown', lastCheck: 0 },
   embeddingFallback: { status: 'unknown', lastCheck: 0 }
 };
@@ -235,6 +259,20 @@ function isRunPodConfigured() {
  */
 function isAnthropicConfigured() {
   return !!ANTHROPIC_API_KEY && !!anthropicClient;
+}
+
+/**
+ * Check if Groq is configured
+ */
+function isGroqConfigured() {
+  return !!GROQ_API_KEY && !!groqClient;
+}
+
+/**
+ * Check if an app should use Groq backend
+ */
+function shouldUseGroq(appName) {
+  return isGroqConfigured() && GROQ_APPS.includes(appName);
 }
 
 /**
@@ -572,6 +610,42 @@ async function callAnthropic(messages, options = {}) {
 }
 
 /**
+ * Call Groq API backend (OpenAI-compatible, free tier)
+ * Used for code-talk, educationelly, educationelly-graphql apps
+ */
+async function callGroq(messages, options = {}) {
+  const { maxTokens = 2048, temperature = 0.7 } = options;
+
+  if (!groqClient) {
+    throw new Error('Groq client not initialized - missing GROQ_API_KEY');
+  }
+
+  console.log(`[Groq] Calling ${GROQ_MODEL} with ${messages.length} messages`);
+
+  const startTime = Date.now();
+
+  const response = await groqClient.chat.completions.create({
+    model: GROQ_MODEL,
+    messages,
+    max_tokens: maxTokens,
+    temperature
+  });
+
+  const content = response.choices?.[0]?.message?.content || '';
+  const usage = response.usage || {};
+  const durationMs = Date.now() - startTime;
+
+  console.log(`[Groq] ✓ Response received (${content.length} chars) in ${durationMs}ms`);
+
+  return {
+    response: content.trim(),
+    model: GROQ_MODEL,
+    backend: 'groq',
+    usage
+  };
+}
+
+/**
  * Call local Llama 3.2 3B backend (llama.cpp server - OpenAI compatible)
  */
 async function callLocal(messages, options = {}) {
@@ -834,6 +908,15 @@ app.get('/health', async (req, res) => {
         url: LOCAL_URL,
         status: 'checking...',
         description: 'Llama 3.2 3B on VPS CPU (always available)'
+      },
+      // External: Groq (free tier for education apps)
+      groq: {
+        tier: 'external',
+        configured: isGroqConfigured(),
+        model: isGroqConfigured() ? GROQ_MODEL : null,
+        apps: GROQ_APPS,
+        status: isGroqConfigured() ? 'checking...' : 'not_configured',
+        description: 'Groq Cloud - free tier for code-talk, educationelly apps'
       }
     }
   };
@@ -887,6 +970,22 @@ app.get('/health', async (req, res) => {
   } catch (error) {
     health.backends.local.status = 'unavailable';
     health.backends.local.error = error.message;
+  }
+
+  // Check Groq health (external API)
+  if (isGroqConfigured()) {
+    try {
+      // Groq uses OpenAI-compatible API - check models endpoint
+      const response = await fetch(`${GROQ_API_URL}/models`, {
+        method: 'GET',
+        headers: { 'Authorization': `Bearer ${GROQ_API_KEY}` },
+        signal: AbortSignal.timeout(5000)
+      });
+      health.backends.groq.status = response.ok ? 'healthy' : 'unhealthy';
+    } catch (error) {
+      health.backends.groq.status = 'unavailable';
+      health.backends.groq.error = error.message;
+    }
   }
 
   // Add embedding backends to health check
@@ -1450,11 +1549,20 @@ and encourage effective learning habits. Be concise and supportive.`;
 
     console.log(`[chat] Processing ${messages.length} messages (context: ${context.app || 'general'})`);
 
-    const result = await chatInference(fullMessages, {
-      maxTokens,
-      temperature,
-      forceBackend: backend
-    });
+    let result;
+
+    // Route to Groq for specific apps (free tier alternative to Claude)
+    if (shouldUseGroq(context.app)) {
+      console.log(`[chat] Routing ${context.app} to Groq backend`);
+      result = await callGroq(fullMessages, { maxTokens, temperature });
+    } else {
+      // Use standard inference chain for other apps
+      result = await chatInference(fullMessages, {
+        maxTokens,
+        temperature,
+        forceBackend: backend
+      });
+    }
 
     console.log(`[chat] ✓ Response generated via ${result.backend} (${result.response.length} chars)`);
 
