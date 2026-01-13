@@ -6,6 +6,7 @@ import { createHash } from 'crypto';
 import Redis from 'ioredis';
 import promClient from 'prom-client';
 import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 
 dotenv.config();
 
@@ -156,18 +157,24 @@ const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'bge_embeddings';
 // ANTHROPIC (CLAUDE) CONFIGURATION - Premium tier for complex reasoning
 // =============================================================================
 // Use Claude for tasks requiring deep reasoning, K8s analysis, complex debugging
+// When Lens Loop is enabled, routes through LiteLLM proxy for observability
 // =============================================================================
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
 
-// Initialize Anthropic client (native SDK)
+// LiteLLM proxy URL - provides OpenAI-compatible interface for Claude
+// Used with Lens Loop for observability (Lens Loop → LiteLLM → Anthropic)
+// External URL via Cloudflare tunnel so Lens Loop (external) can reach it
+const LITELLM_URL = process.env.LITELLM_URL || 'https://litellm.el-jefe.me';
+
+// Initialize Anthropic client (native SDK - fallback when Lens Loop unavailable)
 let anthropicClient = null;
 if (ANTHROPIC_API_KEY) {
   anthropicClient = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 }
 
-// Note: Lens Loop is designed for OpenAI and doesn't properly support Anthropic
-// (forwards over HTTP instead of HTTPS). Claude calls use native Anthropic SDK.
+// OpenAI client for Claude via Lens Loop → LiteLLM (initialized after function defs)
+let openaiClientForClaude = null;
 
 // Health check cache (avoid hammering backends)
 const healthCache = {
@@ -195,6 +202,25 @@ function isLocalGpuConfigured() {
  */
 function isLensLoopConfigured() {
   return !!LENS_LOOP_PROXY;
+}
+
+// Initialize OpenAI client for Claude via Lens Loop → LiteLLM
+// This enables observability by routing through Lens Loop proxy
+if (isLensLoopConfigured() && ANTHROPIC_API_KEY) {
+  // Route through Lens Loop proxy to LiteLLM
+  // URL format: {lens-loop}/openai/{protocol}/{litellm-host}/v1
+  const litellmHost = LITELLM_URL.replace(/^https?:\/\//, '');
+  const protocol = LITELLM_URL.startsWith('https') ? 'https' : 'http';
+  const lensLoopBaseUrl = `${LENS_LOOP_PROXY}/openai/${protocol}/${litellmHost}/v1`;
+
+  openaiClientForClaude = new OpenAI({
+    apiKey: 'not-needed', // LiteLLM uses its own API key
+    baseURL: lensLoopBaseUrl,
+    defaultHeaders: {
+      'X-Loop-Project': LENS_LOOP_PROJECT
+    }
+  });
+  console.log(`[Anthropic] Lens Loop enabled via LiteLLM: ${lensLoopBaseUrl}`);
 }
 
 /**
@@ -452,7 +478,8 @@ async function callRunPod(messages, options = {}) {
 /**
  * Call Anthropic Claude API
  * Best for complex reasoning, K8s analysis, debugging
- * Uses OpenAI SDK via Lens Loop when enabled for observability
+ * Uses OpenAI SDK via Lens Loop → LiteLLM when enabled for observability
+ * Falls back to native Anthropic SDK when Lens Loop unavailable
  */
 async function callAnthropic(messages, options = {}) {
   if (!isAnthropicConfigured()) {
@@ -462,7 +489,7 @@ async function callAnthropic(messages, options = {}) {
   const startTime = Date.now();
   const { maxTokens = 1024, temperature = 0.7 } = options;
 
-  // Extract system message if present
+  // Extract system message if present (for native SDK)
   let systemPrompt = '';
   const chatMessages = [];
 
@@ -478,9 +505,47 @@ async function callAnthropic(messages, options = {}) {
   }
 
   console.log(`[Anthropic] Calling ${ANTHROPIC_MODEL} with ${chatMessages.length} messages`);
-  console.log(`[Anthropic] System prompt (first 1000 chars): ${systemPrompt.substring(0, 1000)}...`);
 
-  // Use native Anthropic SDK
+  // Try Lens Loop → LiteLLM for observability if configured
+  if (openaiClientForClaude) {
+    try {
+      console.log(`[Anthropic] Using Lens Loop → LiteLLM for observability`);
+
+      // OpenAI format includes system message in messages array
+      const openaiMessages = systemPrompt
+        ? [{ role: 'system', content: systemPrompt }, ...chatMessages]
+        : chatMessages;
+
+      const response = await openaiClientForClaude.chat.completions.create({
+        model: 'claude-sonnet', // LiteLLM model alias
+        messages: openaiMessages,
+        max_tokens: maxTokens,
+        temperature
+      });
+
+      const content = response.choices[0]?.message?.content || '';
+      const usage = {
+        prompt_tokens: response.usage?.prompt_tokens,
+        completion_tokens: response.usage?.completion_tokens
+      };
+
+      const durationMs = Date.now() - startTime;
+      console.log(`[Anthropic] ✓ Response via Lens Loop (${content.length} chars) in ${durationMs}ms - traced in project: ${LENS_LOOP_PROJECT}`);
+
+      return {
+        response: content.trim(),
+        model: ANTHROPIC_MODEL,
+        backend: 'anthropic (traced)',
+        usage
+      };
+    } catch (lensLoopError) {
+      console.warn(`[Anthropic] Lens Loop error: ${lensLoopError.message}, falling back to native SDK`);
+    }
+  }
+
+  // Fallback to native Anthropic SDK
+  console.log(`[Anthropic] Using native Anthropic SDK`);
+
   const response = await anthropicClient.messages.create({
     model: ANTHROPIC_MODEL,
     max_tokens: maxTokens,
@@ -1341,35 +1406,47 @@ app.post('/api/ai/chat', async (req, res) => {
       return res.status(400).json({ error: 'Messages array is required' });
     }
 
-    // Build system prompt based on context
-    let systemPrompt = SYSTEM_PROMPTS.educationChat;
+    // Check if messages already contain a system prompt (e.g., from POP dashboard)
+    const hasExistingSystemPrompt = messages.some(m => m.role === 'system');
 
-    if (context.app === 'intervalai' || context.app === 'spaced-repetition') {
-      systemPrompt = `You are a learning assistant for a spaced repetition study app.
+    let fullMessages;
+
+    if (hasExistingSystemPrompt) {
+      // Use the system prompt from the caller (e.g., POP's K8s expert prompt)
+      // This preserves context-aware prompts built by the frontend
+      console.log(`[chat] Using caller-provided system prompt`);
+      fullMessages = messages;
+    } else {
+      // Build system prompt based on context (for apps that don't send their own)
+      let systemPrompt = SYSTEM_PROMPTS.educationChat;
+
+      if (context.app === 'intervalai' || context.app === 'spaced-repetition') {
+        systemPrompt = `You are a learning assistant for a spaced repetition study app.
 Help users understand concepts they're struggling with, provide hints without giving away answers,
 and encourage effective learning habits. Be concise and supportive.`;
-    } else if (context.app === 'code-talk') {
-      systemPrompt = SYSTEM_PROMPTS.code;
-    } else if (context.userRole === 'teacher') {
-      systemPrompt += `\n\nYou are speaking with a teacher. Focus on pedagogical strategies and professional insights.`;
-    } else if (context.userRole === 'student') {
-      const gradeLevel = context.gradeLevel || 'unknown';
-      systemPrompt += `\n\nYou are speaking with a student (grade level: ${gradeLevel}). Use age-appropriate language and be encouraging.`;
-    }
+      } else if (context.app === 'code-talk') {
+        systemPrompt = SYSTEM_PROMPTS.code;
+      } else if (context.userRole === 'teacher') {
+        systemPrompt += `\n\nYou are speaking with a teacher. Focus on pedagogical strategies and professional insights.`;
+      } else if (context.userRole === 'student') {
+        const gradeLevel = context.gradeLevel || 'unknown';
+        systemPrompt += `\n\nYou are speaking with a student (grade level: ${gradeLevel}). Use age-appropriate language and be encouraging.`;
+      }
 
-    // Add context info if provided
-    if (context.ellStatus) {
-      systemPrompt += `\nStudent ELL status: ${context.ellStatus}`;
-    }
-    if (context.nativeLanguage) {
-      systemPrompt += `\nStudent native language: ${context.nativeLanguage}`;
-    }
+      // Add context info if provided
+      if (context.ellStatus) {
+        systemPrompt += `\nStudent ELL status: ${context.ellStatus}`;
+      }
+      if (context.nativeLanguage) {
+        systemPrompt += `\nStudent native language: ${context.nativeLanguage}`;
+      }
 
-    // Build full messages array with system prompt
-    const fullMessages = [
-      { role: 'system', content: systemPrompt },
-      ...messages
-    ];
+      // Build full messages array with system prompt
+      fullMessages = [
+        { role: 'system', content: systemPrompt },
+        ...messages
+      ];
+    }
 
     console.log(`[chat] Processing ${messages.length} messages (context: ${context.app || 'general'})`);
 
