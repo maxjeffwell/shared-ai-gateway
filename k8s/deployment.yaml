@@ -62,7 +62,7 @@ spec:
             - name: LITELLM_URL
               value: "https://litellm.el-jefe.me"
             - name: LENS_LOOP_PROJECT
-              value: "portfolio-apps"
+              value: "lens-loop-project"
           resources:
             requests:
               cpu: 100m
