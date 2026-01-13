@@ -248,21 +248,22 @@ if (isLensLoopConfigured() && ANTHROPIC_API_KEY) {
 }
 
 // Initialize Groq client with Lens Loop for observability
-// Groq is OpenAI-compatible, so we route directly through Lens Loop (no LiteLLM needed)
+// Routes through Lens Loop → LiteLLM → Groq (same pattern as Claude)
 let groqClientWithLensLoop = null;
 if (isLensLoopConfigured() && GROQ_API_KEY) {
-  // Route through Lens Loop proxy directly to Groq
-  // URL format: {lens-loop}/openai/https/api.groq.com/openai/v1
-  const lensLoopGroqUrl = `${LENS_LOOP_PROXY}/openai/https/api.groq.com/openai/v1`;
+  // Route through Lens Loop proxy to LiteLLM (which handles Groq)
+  const litellmHost = LITELLM_URL.replace(/^https?:\/\//, '');
+  const protocol = LITELLM_URL.startsWith('https') ? 'https' : 'http';
+  const lensLoopGroqUrl = `${LENS_LOOP_PROXY}/openai/${protocol}/${litellmHost}/v1`;
 
   groqClientWithLensLoop = new OpenAI({
-    apiKey: GROQ_API_KEY,
+    apiKey: 'not-needed', // LiteLLM uses its own API key
     baseURL: lensLoopGroqUrl,
     defaultHeaders: {
       'X-Loop-Project': LENS_LOOP_PROJECT
     }
   });
-  console.log(`[Groq] Lens Loop enabled: ${lensLoopGroqUrl}`);
+  console.log(`[Groq] Lens Loop enabled via LiteLLM: ${lensLoopGroqUrl}`);
 }
 
 /**
@@ -643,13 +644,13 @@ async function callGroq(messages, options = {}) {
 
   const startTime = Date.now();
 
-  // Try Lens Loop for observability if configured
+  // Try Lens Loop → LiteLLM for observability if configured
   if (groqClientWithLensLoop) {
     try {
-      console.log(`[Groq] Using Lens Loop for observability`);
+      console.log(`[Groq] Using Lens Loop → LiteLLM for observability`);
 
       const response = await groqClientWithLensLoop.chat.completions.create({
-        model: GROQ_MODEL,
+        model: 'groq-llama', // LiteLLM model alias for Groq
         messages,
         max_tokens: maxTokens,
         temperature

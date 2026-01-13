@@ -1,6 +1,6 @@
 ---
-# LiteLLM Proxy - OpenAI-compatible proxy for Anthropic Claude
-# Enables Lens Loop observability by translating OpenAI format to Anthropic
+# LiteLLM Proxy - OpenAI-compatible proxy for multiple LLM providers
+# Enables Lens Loop observability for Claude and Groq
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -12,6 +12,7 @@ metadata:
 data:
   config.yaml: |
     model_list:
+      # Anthropic Claude models
       - model_name: claude-sonnet
         litellm_params:
           model: anthropic/claude-sonnet-4-20250514
@@ -24,6 +25,15 @@ data:
         litellm_params:
           model: anthropic/claude-3-5-sonnet-20241022
           api_key: "os.environ/ANTHROPIC_API_KEY"
+      # Groq models (for code-talk, educationelly apps)
+      - model_name: groq-llama
+        litellm_params:
+          model: groq/llama-3.3-70b-versatile
+          api_key: "os.environ/GROQ_API_KEY"
+      - model_name: llama-3.3-70b-versatile
+        litellm_params:
+          model: groq/llama-3.3-70b-versatile
+          api_key: "os.environ/GROQ_API_KEY"
 
     litellm_settings:
       drop_params: true
@@ -68,6 +78,11 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: anthropic-credentials
+                  key: api-key
+            - name: GROQ_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: groq-credentials
                   key: api-key
           resources:
             requests:
