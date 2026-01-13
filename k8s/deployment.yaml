@@ -56,7 +56,9 @@ spec:
             - name: ANTHROPIC_MODEL
               value: "claude-sonnet-4-20250514"
             - name: CACHE_ENABLED
-              value: "false"
+              value: "true"
+            - name: REDIS_URL
+              value: "redis://:redis123@redis:6379"
             - name: LENS_LOOP_PROXY
               value: "https://lens-loop.el-jefe.me"
             - name: LITELLM_URL
@@ -67,6 +69,16 @@ spec:
               value: "https://embeddings.el-jefe.me"
             - name: LOCAL_GPU_URL
               value: "https://gpu.el-jefe.me"
+            - name: RUNPOD_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ai-gateway-credentials
+                  key: RUNPOD_API_KEY
+            - name: RUNPOD_ENDPOINT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ai-gateway-credentials
+                  key: RUNPOD_ENDPOINT_ID
           resources:
             requests:
               cpu: 100m
