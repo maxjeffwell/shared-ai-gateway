@@ -247,6 +247,24 @@ if (isLensLoopConfigured() && ANTHROPIC_API_KEY) {
   console.log(`[Anthropic] Lens Loop enabled via LiteLLM: ${lensLoopBaseUrl}`);
 }
 
+// Initialize Groq client with Lens Loop for observability
+// Groq is OpenAI-compatible, so we route directly through Lens Loop (no LiteLLM needed)
+let groqClientWithLensLoop = null;
+if (isLensLoopConfigured() && GROQ_API_KEY) {
+  // Route through Lens Loop proxy directly to Groq
+  // URL format: {lens-loop}/openai/https/api.groq.com/openai/v1
+  const lensLoopGroqUrl = `${LENS_LOOP_PROXY}/openai/https/api.groq.com/openai/v1`;
+
+  groqClientWithLensLoop = new OpenAI({
+    apiKey: GROQ_API_KEY,
+    baseURL: lensLoopGroqUrl,
+    defaultHeaders: {
+      'X-Loop-Project': LENS_LOOP_PROJECT
+    }
+  });
+  console.log(`[Groq] Lens Loop enabled: ${lensLoopGroqUrl}`);
+}
+
 /**
  * Check if RunPod is configured
  */
@@ -612,6 +630,7 @@ async function callAnthropic(messages, options = {}) {
 /**
  * Call Groq API backend (OpenAI-compatible, free tier)
  * Used for code-talk, educationelly, educationelly-graphql apps
+ * Routes through Lens Loop for observability when configured
  */
 async function callGroq(messages, options = {}) {
   const { maxTokens = 2048, temperature = 0.7 } = options;
@@ -623,6 +642,38 @@ async function callGroq(messages, options = {}) {
   console.log(`[Groq] Calling ${GROQ_MODEL} with ${messages.length} messages`);
 
   const startTime = Date.now();
+
+  // Try Lens Loop for observability if configured
+  if (groqClientWithLensLoop) {
+    try {
+      console.log(`[Groq] Using Lens Loop for observability`);
+
+      const response = await groqClientWithLensLoop.chat.completions.create({
+        model: GROQ_MODEL,
+        messages,
+        max_tokens: maxTokens,
+        temperature
+      });
+
+      const content = response.choices?.[0]?.message?.content || '';
+      const usage = response.usage || {};
+      const durationMs = Date.now() - startTime;
+
+      console.log(`[Groq] ✓ Response via Lens Loop (${content.length} chars) in ${durationMs}ms - traced in project: ${LENS_LOOP_PROJECT}`);
+
+      return {
+        response: content.trim(),
+        model: GROQ_MODEL,
+        backend: 'groq (traced)',
+        usage
+      };
+    } catch (lensLoopError) {
+      console.warn(`[Groq] Lens Loop error: ${lensLoopError.message}, falling back to direct API`);
+    }
+  }
+
+  // Fallback to direct Groq API
+  console.log(`[Groq] Using direct Groq API`);
 
   const response = await groqClient.chat.completions.create({
     model: GROQ_MODEL,
