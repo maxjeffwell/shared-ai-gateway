@@ -65,6 +65,8 @@ spec:
               value: "lens-loop-project"
             - name: EMBEDDING_PRIMARY_URL
               value: "https://embeddings.el-jefe.me"
+            - name: LOCAL_GPU_URL
+              value: "https://gpu.el-jefe.me"
           resources:
             requests:
               cpu: 100m
