@@ -58,7 +58,7 @@ spec:
             - name: CACHE_ENABLED
               value: "false"
             - name: LENS_LOOP_PROXY
-              value: "http://lens-loop.el-jefe.me"
+              value: "https://lens-loop.el-jefe.me"
             - name: LITELLM_URL
               value: "https://litellm.el-jefe.me"
             - name: LENS_LOOP_PROJECT
