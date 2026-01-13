@@ -1606,7 +1606,18 @@ and encourage effective learning habits. Be concise and supportive.`;
     // Route to Groq for specific apps (free tier alternative to Claude)
     if (shouldUseGroq(context.app)) {
       console.log(`[chat] Routing ${context.app} to Groq backend`);
-      result = await callGroq(fullMessages, { maxTokens, temperature });
+      try {
+        result = await callGroq(fullMessages, { maxTokens, temperature });
+      } catch (groqError) {
+        // Fallback to Anthropic if Groq rate limits (429) or fails
+        if (groqError.message.includes('429') || groqError.message.includes('rate limit')) {
+          console.log(`[chat] Groq rate limited, falling back to Anthropic`);
+          fallbackCounter.inc({ from_tier: 'groq', to_tier: 'anthropic', reason: 'rate_limit' });
+          result = await callAnthropic(fullMessages, { maxTokens, temperature });
+        } else {
+          throw groqError;
+        }
+      }
     } else {
       // Use standard inference chain for other apps
       result = await chatInference(fullMessages, {
