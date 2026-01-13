@@ -1,0 +1,130 @@
+---
+# Shared AI Gateway - Node.js Express server that routes AI requests
+# Provides fallback chain: Groq -> Local GPU -> Anthropic
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ai-gateway-credentials
+  labels:
+    app: shared-ai-gateway
+    component: ai-gateway
+    tier: ai
+type: Opaque
+stringData:
+  # Replace with actual values or use kubectl create secret
+  GROQ_API_KEY: "placeholder-replace-me"
+  ANTHROPIC_API_KEY: "placeholder-replace-me"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shared-ai-gateway
+  labels:
+    app: shared-ai-gateway
+    component: ai-gateway
+    portfolio: "true"
+    tier: ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: shared-ai-gateway
+  template:
+    metadata:
+      labels:
+        app: shared-ai-gateway
+        component: ai-gateway
+        portfolio: "true"
+        tier: ai
+    spec:
+      containers:
+        - name: ai-gateway
+          image: maxjeffwell/shared-ai-gateway:latest
+          ports:
+            - containerPort: 8002
+              name: http
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8002"
+            - name: BACKEND_PREFERENCE
+              value: "auto"
+            - name: GROQ_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ai-gateway-credentials
+                  key: GROQ_API_KEY
+            - name: GROQ_MODEL
+              value: "llama-3.3-70b-versatile"
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ai-gateway-credentials
+                  key: ANTHROPIC_API_KEY
+            - name: ANTHROPIC_MODEL
+              value: "claude-sonnet-4-20250514"
+            - name: CACHE_ENABLED
+              value: "false"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8002
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8002
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shared-ai-gateway
+  labels:
+    app: shared-ai-gateway
+    component: ai-gateway
+    tier: ai
+spec:
+  type: ClusterIP
+  selector:
+    app: shared-ai-gateway
+  ports:
+    - name: http
+      port: 8002
+      targetPort: 8002
+      protocol: TCP
+---
+# Network policy to allow portfolio apps to reach AI gateway
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-apps-to-ai-gateway
+  labels:
+    app: shared-ai-gateway
+    component: ai-gateway
+    tier: ai
+spec:
+  podSelector:
+    matchLabels:
+      app: shared-ai-gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              portfolio: "true"
+      ports:
+        - protocol: TCP
+          port: 8002
