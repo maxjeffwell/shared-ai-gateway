@@ -63,6 +63,8 @@ spec:
               value: "https://litellm.el-jefe.me"
             - name: LENS_LOOP_PROJECT
               value: "lens-loop-project"
+            - name: EMBEDDING_PRIMARY_URL
+              value: "https://embeddings.el-jefe.me"
           resources:
             requests:
               cpu: 100m
