@@ -97,14 +97,14 @@ spec:
               subPath: config.yaml
           livenessProbe:
             httpGet:
-              path: /health
+              path: /health/liveliness  # Don't use /health - it makes real API calls!
               port: 4000
             initialDelaySeconds: 30
             periodSeconds: 30
             timeoutSeconds: 10
           readinessProbe:
             httpGet:
-              path: /health
+              path: /health/readiness  # Don't use /health - it makes real API calls!
               port: 4000
             initialDelaySeconds: 10
             periodSeconds: 10
