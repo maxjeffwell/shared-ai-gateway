@@ -796,9 +796,24 @@ async function inference(prompt, options = {}) {
 
   if (backend === 'anthropic' || backend === 'claude') {
     if (!isAnthropicConfigured()) {
-      throw new Error('Anthropic requested but not configured');
+      // Anthropic not configured, try Groq as fallback
+      if (isGroqConfigured()) {
+        console.log('[inference] Anthropic not configured, using Groq fallback');
+        return instrumentedCall('groq', () => callGroq(messages, { maxTokens, temperature }));
+      }
+      throw new Error('Anthropic requested but not configured (Groq fallback also unavailable)');
     }
-    return instrumentedCall('anthropic', () => callAnthropic(messages, { maxTokens, temperature }));
+    // Try Anthropic, fallback to Groq on failure
+    try {
+      return await instrumentedCall('anthropic', () => callAnthropic(messages, { maxTokens, temperature }));
+    } catch (anthropicError) {
+      if (isGroqConfigured()) {
+        console.warn(`[inference] Anthropic failed: ${anthropicError.message}, falling back to Groq`);
+        fallbackCounter.inc({ from_tier: 'anthropic', to_tier: 'groq', reason: 'error' });
+        return await instrumentedCall('groq', () => callGroq(messages, { maxTokens, temperature }));
+      }
+      throw anthropicError;
+    }
   }
 
   if (backend === 'local') {
@@ -1477,9 +1492,24 @@ async function chatInference(messages, options = {}) {
 
   if (backend === 'anthropic' || backend === 'claude') {
     if (!isAnthropicConfigured()) {
-      throw new Error('Anthropic requested but not configured');
+      // Anthropic not configured, try Groq as fallback
+      if (isGroqConfigured()) {
+        console.log('[chat] Anthropic not configured, using Groq fallback');
+        return instrumentedCall('groq', () => callGroq(messages, { maxTokens, temperature }), 'chat');
+      }
+      throw new Error('Anthropic requested but not configured (Groq fallback also unavailable)');
     }
-    return instrumentedCall('anthropic', () => callAnthropic(messages, { maxTokens, temperature }), 'chat');
+    // Try Anthropic, fallback to Groq on failure
+    try {
+      return await instrumentedCall('anthropic', () => callAnthropic(messages, { maxTokens, temperature }), 'chat');
+    } catch (anthropicError) {
+      if (isGroqConfigured()) {
+        console.warn(`[chat] Anthropic failed: ${anthropicError.message}, falling back to Groq`);
+        fallbackCounter.inc({ from_tier: 'anthropic', to_tier: 'groq', reason: 'error' });
+        return await instrumentedCall('groq', () => callGroq(messages, { maxTokens, temperature }), 'chat');
+      }
+      throw anthropicError;
+    }
   }
 
   if (backend === 'local') {
