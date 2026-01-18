@@ -97,9 +97,17 @@ async function getFromCache(key) {
 
 /**
  * Store response in cache
+ * Only caches non-empty responses to avoid caching failures
  */
 async function setInCache(key, value, ttl = CACHE_TTL) {
   if (!redis || !CACHE_ENABLED) return;
+
+  // Don't cache empty or invalid responses
+  if (!value || !value.response || value.response.trim() === '' || value.response.length < 5) {
+    console.log(`[Cache] SKIP: Not caching empty/short response`);
+    return;
+  }
+
   try {
     await redis.setex(key, ttl, JSON.stringify(value));
     console.log(`[Cache] SET: ${key.substring(0, 20)}... (TTL: ${ttl}s)`);
