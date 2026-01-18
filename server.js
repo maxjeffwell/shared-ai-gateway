@@ -837,20 +837,42 @@ async function inference(prompt, options = {}) {
         return gpuResult;
       } catch (error) {
         console.warn(`[auto] Local GPU failed: ${error.message}`);
-        fallbackCounter.inc({ from_tier: 'marmoset-gpu', to_tier: 'runpod', reason: 'error' });
+        fallbackCounter.inc({ from_tier: 'marmoset-gpu', to_tier: 'vps-cpu', reason: 'error' });
         // Mark as unhealthy to skip on next request
         healthCache.localGpu = { status: 'unavailable', lastCheck: Date.now() };
       }
     } else {
       console.log('[auto] Local GPU unavailable, skipping Tier 1');
-      fallbackCounter.inc({ from_tier: 'marmoset-gpu', to_tier: 'runpod', reason: 'unhealthy' });
+      fallbackCounter.inc({ from_tier: 'marmoset-gpu', to_tier: 'vps-cpu', reason: 'unhealthy' });
     }
   }
 
-  // Tier 2: RunPod GPU (paid, but fast)
+  // Tier 2: VPS CPU (reliable fallback)
+  const localHealthy = await checkBackendHealth('local');
+  backendGauge.set({ backend: 'vps-cpu' }, localHealthy ? 1 : 0);
+  if (localHealthy) {
+    try {
+      console.log('[auto] Trying VPS CPU (Tier 2)...');
+      const localResult = await instrumentedCall('vps-cpu', () => callLocal(messages, { maxTokens, temperature }));
+      // Cache the result for low-temperature requests
+      if (!skipCache && temperature <= 0.5) {
+        const cacheKey = getCacheKey(prompt, { systemPrompt, maxTokens, backend });
+        await setInCache(cacheKey, localResult);
+      }
+      return localResult;
+    } catch (error) {
+      console.warn(`[auto] VPS CPU failed: ${error.message}`);
+      fallbackCounter.inc({ from_tier: 'vps-cpu', to_tier: 'runpod', reason: 'error' });
+    }
+  } else {
+    console.log('[auto] VPS CPU unavailable, skipping Tier 2');
+    fallbackCounter.inc({ from_tier: 'vps-cpu', to_tier: 'runpod', reason: 'unhealthy' });
+  }
+
+  // Tier 3: RunPod GPU (paid cloud fallback)
   if (isRunPodConfigured()) {
     try {
-      console.log('[auto] Trying RunPod GPU (Tier 2)...');
+      console.log('[auto] Trying RunPod GPU (Tier 3)...');
       const runpodResult = await instrumentedCall('runpod', () => callRunPod(messages, { maxTokens, temperature }));
       // Cache the result for low-temperature requests
       if (!skipCache && temperature <= 0.5) {
@@ -860,21 +882,12 @@ async function inference(prompt, options = {}) {
       return runpodResult;
     } catch (error) {
       console.warn(`[auto] RunPod failed: ${error.message}`);
-      fallbackCounter.inc({ from_tier: 'runpod', to_tier: 'vps-cpu', reason: 'error' });
+      fallbackCounter.inc({ from_tier: 'runpod', to_tier: 'none', reason: 'error' });
     }
   }
 
-  // Tier 3: VPS CPU (always available fallback)
-  console.log('[auto] Falling back to VPS CPU (Tier 3)...');
-  const localResult = await instrumentedCall('vps-cpu', () => callLocal(messages, { maxTokens, temperature }));
-
-  // Cache the result for low-temperature requests
-  if (!skipCache && temperature <= 0.5) {
-    const cacheKey = getCacheKey(prompt, { systemPrompt, maxTokens, backend });
-    await setInCache(cacheKey, localResult);
-  }
-
-  return localResult;
+  // All backends failed
+  throw new Error('All inference backends failed');
 }
 
 app.use(cors());
@@ -1527,28 +1540,42 @@ async function chatInference(messages, options = {}) {
         return await instrumentedCall('marmoset-gpu', () => callLocalGpu(messages, { maxTokens, temperature }), 'chat');
       } catch (error) {
         console.warn(`[chat-auto] Local GPU failed: ${error.message}`);
-        fallbackCounter.inc({ from_tier: 'marmoset-gpu', to_tier: 'runpod', reason: 'error' });
+        fallbackCounter.inc({ from_tier: 'marmoset-gpu', to_tier: 'vps-cpu', reason: 'error' });
         healthCache.localGpu = { status: 'unavailable', lastCheck: Date.now() };
       }
     } else {
-      fallbackCounter.inc({ from_tier: 'marmoset-gpu', to_tier: 'runpod', reason: 'unhealthy' });
+      fallbackCounter.inc({ from_tier: 'marmoset-gpu', to_tier: 'vps-cpu', reason: 'unhealthy' });
     }
   }
 
-  // Tier 2: RunPod GPU (paid, but fast)
+  // Tier 2: VPS CPU (reliable fallback)
+  const localHealthy = await checkBackendHealth('local');
+  backendGauge.set({ backend: 'vps-cpu' }, localHealthy ? 1 : 0);
+  if (localHealthy) {
+    try {
+      console.log('[chat-auto] Trying VPS CPU (Tier 2)...');
+      return await instrumentedCall('vps-cpu', () => callLocal(messages, { maxTokens, temperature }), 'chat');
+    } catch (error) {
+      console.warn(`[chat-auto] VPS CPU failed: ${error.message}`);
+      fallbackCounter.inc({ from_tier: 'vps-cpu', to_tier: 'runpod', reason: 'error' });
+    }
+  } else {
+    fallbackCounter.inc({ from_tier: 'vps-cpu', to_tier: 'runpod', reason: 'unhealthy' });
+  }
+
+  // Tier 3: RunPod GPU (paid cloud fallback)
   if (isRunPodConfigured()) {
     try {
-      console.log('[chat-auto] Trying RunPod GPU (Tier 2)...');
+      console.log('[chat-auto] Trying RunPod GPU (Tier 3)...');
       return await instrumentedCall('runpod', () => callRunPod(messages, { maxTokens, temperature }), 'chat');
     } catch (error) {
       console.warn(`[chat-auto] RunPod failed: ${error.message}`);
-      fallbackCounter.inc({ from_tier: 'runpod', to_tier: 'vps-cpu', reason: 'error' });
+      fallbackCounter.inc({ from_tier: 'runpod', to_tier: 'none', reason: 'error' });
     }
   }
 
-  // Tier 3: VPS CPU (always available fallback)
-  console.log('[chat-auto] Falling back to VPS CPU (Tier 3)...');
-  return await instrumentedCall('vps-cpu', () => callLocal(messages, { maxTokens, temperature }), 'chat');
+  // All backends failed
+  throw new Error('All chat inference backends failed');
 }
 
 /**
