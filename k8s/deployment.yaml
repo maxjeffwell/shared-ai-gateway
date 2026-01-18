@@ -71,6 +71,8 @@ spec:
               value: "https://gpu.el-jefe.me"
             - name: LOCAL_GPU_MODEL
               value: "llama3.2:3b-instruct-q4_K_M"
+            - name: LOCAL_URL
+              value: "http://llama-cpu-service:8080"
             - name: RUNPOD_API_KEY
               valueFrom:
                 secretKeyRef:
