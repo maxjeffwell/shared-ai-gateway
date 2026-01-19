@@ -195,7 +195,7 @@ const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 const GROQ_API_URL = 'https://api.groq.com/openai/v1';
 
 // Apps that should use Groq instead of other backends
-const GROQ_APPS = ['code-talk', 'educationelly', 'educationelly-graphql'];
+const GROQ_APPS = ['code-talk', 'educationelly', 'educationelly-graphql', 'bookmarks'];
 
 // Initialize Groq client (OpenAI-compatible)
 let groqClient = null;
@@ -384,7 +384,7 @@ async function callHuggingFace(messages, options = {}) {
 
   console.log(`[HuggingFace] Calling ${HUGGINGFACE_MODEL}`);
 
-  const response = await fetch(`https://api-inference.huggingface.co/models/${HUGGINGFACE_MODEL}`, {
+  const response = await fetch(`https://router.huggingface.co/hf-inference/models/${HUGGINGFACE_MODEL}`, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${HUGGINGFACE_API_KEY}`,
@@ -964,7 +964,7 @@ app.get('/health', async (req, res) => {
         model: isGroqConfigured() ? GROQ_MODEL : null,
         apps: GROQ_APPS,
         status: isGroqConfigured() ? 'checking...' : 'not_configured',
-        description: 'Groq Cloud - free tier for code-talk, educationelly apps'
+        description: 'Groq Cloud - free tier for code-talk, educationelly, bookmarks apps'
       }
     }
   };
@@ -973,7 +973,7 @@ app.get('/health', async (req, res) => {
   if (isHuggingFaceConfigured()) {
     try {
       // Simple health check - just verify API is reachable
-      const response = await fetch(`https://api-inference.huggingface.co/models/${HUGGINGFACE_MODEL}`, {
+      const response = await fetch(`https://router.huggingface.co/hf-inference/models/${HUGGINGFACE_MODEL}`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${HUGGINGFACE_API_KEY}`,
@@ -1108,15 +1108,16 @@ app.get('/health', async (req, res) => {
   };
 
   // Determine active backend (what would be used for next request)
-  if (health.backends.localGpu.status === 'healthy') {
-    health.activeBackend = 'localGpu';
-    health.activeDescription = 'Using your GTX 1080 (free, fast)';
-  } else if (health.backends.runpod.status === 'healthy') {
-    health.activeBackend = 'runpod';
-    health.activeDescription = 'Using RunPod RTX 4090 (paid)';
+  // Tier order: HuggingFace → VPS CPU → RunPod
+  if (health.backends.huggingface.status === 'healthy') {
+    health.activeBackend = 'huggingface';
+    health.activeDescription = 'Using HuggingFace Inference API (fast, cheap)';
   } else if (health.backends.local.status === 'healthy') {
     health.activeBackend = 'local';
     health.activeDescription = 'Using VPS CPU (slow but reliable)';
+  } else if (health.backends.runpod.status === 'healthy') {
+    health.activeBackend = 'runpod';
+    health.activeDescription = 'Using RunPod RTX 4090 (paid)';
   } else {
     health.activeBackend = 'none';
     health.activeDescription = 'No backends available!';
@@ -1124,9 +1125,9 @@ app.get('/health', async (req, res) => {
 
   // Overall status
   const healthyCount = [
-    health.backends.localGpu.status,
-    health.backends.runpod.status,
-    health.backends.local.status
+    health.backends.huggingface.status,
+    health.backends.local.status,
+    health.backends.runpod.status
   ].filter(s => s === 'healthy').length;
 
   health.status = healthyCount >= 2 ? 'ok' : healthyCount === 1 ? 'degraded' : 'critical';
@@ -1166,12 +1167,25 @@ app.post('/api/ai/generate', async (req, res) => {
 
     console.log(`[${app}] Generating: ${prompt.substring(0, 60)}...`);
 
-    const result = await inference(prompt, {
-      systemPrompt: system,
-      maxTokens,
-      temperature,
-      forceBackend: backend
-    });
+    let result;
+
+    // Route to Groq for specific apps (free tier)
+    if (shouldUseGroq(app) && !backend) {
+      console.log(`[${app}] Routing to Groq backend`);
+      const messages = [];
+      if (system) {
+        messages.push({ role: 'system', content: system });
+      }
+      messages.push({ role: 'user', content: prompt });
+      result = await instrumentedCall('groq', () => callGroq(messages, { maxTokens, temperature }));
+    } else {
+      result = await inference(prompt, {
+        systemPrompt: system,
+        maxTokens,
+        temperature,
+        forceBackend: backend
+      });
+    }
 
     console.log(`[${app}] ✓ Generation complete via ${result.backend} (${result.response.length} chars)`);
 
