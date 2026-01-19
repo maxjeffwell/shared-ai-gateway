@@ -120,23 +120,27 @@ const app = express();
 const PORT = process.env.PORT || 8002;
 
 // =============================================================================
-// BACKEND CONFIGURATION - 3-Tier GPU Fallback System
+// BACKEND CONFIGURATION - 3-Tier Fallback System
 // =============================================================================
-// Priority 1: Local GPU (your GTX 1080 via Ollama + Cloudflare tunnel)
-// Priority 2: RunPod GPU (cloud RTX 4090 - serverless, pay-per-use)
-// Priority 3: VPS CPU (llama-3b - always available fallback)
+// Priority 1: HuggingFace Inference API (fast, reliable, cheap)
+// Priority 2: VPS CPU (llama-3b - always available fallback)
+// Priority 3: RunPod GPU (cloud RTX 4090 - serverless, pay-per-use)
 // =============================================================================
 
-// Tier 1: Local GPU - Ollama via Cloudflare tunnel (optional, can go offline)
-const LOCAL_GPU_URL = process.env.LOCAL_GPU_URL; // e.g., https://gpu.yourdomain.com
-const LOCAL_GPU_MODEL = process.env.LOCAL_GPU_MODEL || 'llama3.1:8b-instruct-q4_K_M';
+// Tier 1: HuggingFace Inference API
+const HUGGINGFACE_API_KEY = process.env.HUGGINGFACE_API_KEY;
+const HUGGINGFACE_MODEL = process.env.HF_MODEL || 'mistralai/Mistral-7B-Instruct-v0.3';
 
 // Lens Loop Observability - proxy for LLM tracing (optional)
 // When enabled, routes requests through Lens Loop for observability
 const LENS_LOOP_PROXY = process.env.LENS_LOOP_PROXY; // e.g., http://host.docker.internal:31300
 const LENS_LOOP_PROJECT = process.env.LENS_LOOP_PROJECT || 'lens-loop-project';
 
-// Tier 2: RunPod GPU - Llama 3.1 8B on RTX 4090 (cloud, serverless)
+// Tier 2: VPS CPU - Llama 3.2 3B via llama.cpp server (always available)
+const LOCAL_URL = process.env.LOCAL_URL || 'http://llama-3b-service:8080';
+const LOCAL_MODEL = 'llama-3.2-3b-instruct';
+
+// Tier 3: RunPod GPU - Llama 3.1 8B on RTX 4090 (cloud, serverless)
 const RUNPOD_API_KEY = process.env.RUNPOD_API_KEY;
 const RUNPOD_ENDPOINT_ID = process.env.RUNPOD_ENDPOINT_ID;
 const RUNPOD_BASE_URL = RUNPOD_ENDPOINT_ID
@@ -144,18 +148,14 @@ const RUNPOD_BASE_URL = RUNPOD_ENDPOINT_ID
   : null;
 const RUNPOD_MODEL = process.env.RUNPOD_MODEL || 'meta-llama/Llama-3.1-8B-Instruct';
 
-// Tier 3: VPS CPU - Llama 3.2 3B via llama.cpp server (always available)
-const LOCAL_URL = process.env.LOCAL_URL || 'http://llama-3b-service:8080';
-const LOCAL_MODEL = 'llama-3.2-3b-instruct';
-
 // Backend preference: 'auto' (smart fallback), 'local-gpu', 'runpod', 'local'
 const BACKEND_PREFERENCE = process.env.BACKEND_PREFERENCE || 'auto';
 
 // =============================================================================
 // EMBEDDING BACKEND CONFIGURATION - 2-Tier Fallback
 // =============================================================================
-// Tier 1: Local GPU Triton (GTX 1080 with bge_embeddings via Cloudflare tunnel)
-// Tier 2: VPS CPU Triton (triton-embeddings in cluster)
+// Tier 1: VPS CPU Triton (always available)
+// Tier 2: Local GPU Triton (GTX 1080 with bge_embeddings via Cloudflare tunnel)
 // =============================================================================
 const EMBEDDING_PRIMARY_URL = process.env.EMBEDDING_PRIMARY_URL; // e.g., https://embeddings.el-jefe.me
 const EMBEDDING_FALLBACK_URL = process.env.EMBEDDING_FALLBACK_URL || 'http://triton-embeddings:8000';
@@ -209,7 +209,7 @@ if (GROQ_API_KEY) {
 
 // Health check cache (avoid hammering backends)
 const healthCache = {
-  localGpu: { status: 'unknown', lastCheck: 0 },
+  huggingface: { status: 'unknown', lastCheck: 0 },
   runpod: { status: 'unknown', lastCheck: 0 },
   local: { status: 'unknown', lastCheck: 0 },
   anthropic: { status: 'unknown', lastCheck: 0 },
@@ -223,10 +223,10 @@ const HEALTH_CACHE_TTL = 30000; // 30 seconds
 const INFERENCE_URL = process.env.INFERENCE_URL || LOCAL_URL;
 
 /**
- * Check if Local GPU (Ollama) is configured
+ * Check if HuggingFace Inference API is configured
  */
-function isLocalGpuConfigured() {
-  return !!LOCAL_GPU_URL;
+function isHuggingFaceConfigured() {
+  return !!HUGGINGFACE_API_KEY;
 }
 
 /**
@@ -359,108 +359,68 @@ async function checkBackendHealth(backend) {
 }
 
 /**
- * Call Local GPU (Ollama) via Cloudflare tunnel
- * Routes through Lens Loop proxy when configured for LLM observability
- * Uses OpenAI-compatible chat format when routed through Lens Loop
+ * Call HuggingFace Inference API
+ * Fast, reliable inference for open-source models
  */
-async function callLocalGpu(messages, options = {}) {
-  if (!isLocalGpuConfigured()) {
-    throw new Error('Local GPU not configured');
+async function callHuggingFace(messages, options = {}) {
+  if (!isHuggingFaceConfigured()) {
+    throw new Error('HuggingFace not configured');
   }
 
   const { maxTokens = 1024, temperature = 0.7 } = options;
 
-  // Try Lens Loop for observability if configured (graceful fallback to direct if unavailable)
-  if (isLensLoopConfigured()) {
-    try {
-      console.log(`[LocalGPU] Calling ${LOCAL_GPU_MODEL} via Lens Loop proxy`);
-
-      // Lens Loop expects OpenAI-compatible format
-      // URL format: http://<proxy>/openai/<target>/v1/chat/completions
-      const targetUrl = LOCAL_GPU_URL.replace(/^https?:\/\//, '');
-      const lensLoopUrl = `${LENS_LOOP_PROXY}/openai/http/${targetUrl}/v1/chat/completions`;
-
-      const response = await fetch(lensLoopUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Loop-Project': LENS_LOOP_PROJECT
-        },
-        body: JSON.stringify({
-          model: LOCAL_GPU_MODEL,
-          messages,
-          max_tokens: maxTokens,
-          temperature
-        }),
-        signal: AbortSignal.timeout(10000) // 10s timeout for proxy (fail fast)
-      });
-
-      if (!response.ok) {
-        const error = await response.text();
-        // Check if it's a proxy unavailable error (502, 503, connection refused)
-        if (response.status === 502 || response.status === 503 || response.status === 504) {
-          console.log(`[LocalGPU] Lens Loop proxy unavailable (${response.status}), falling back to direct GPU call`);
-          // Fall through to direct call below
-        } else {
-          throw new Error(`Local GPU (via Lens Loop) error ${response.status}: ${error}`);
-        }
-      } else {
-        const data = await response.json();
-        const content = data.choices?.[0]?.message?.content || '';
-
-        console.log(`[LocalGPU] ✓ Response via Lens Loop (${content.length} chars) - traced in project: ${LENS_LOOP_PROJECT}`);
-
-        return {
-          response: content.trim(),
-          model: LOCAL_GPU_MODEL,
-          backend: 'local-gpu (traced)',
-          usage: data.usage || {
-            prompt_tokens: 0,
-            completion_tokens: 0
-          }
-        };
-      }
-    } catch (lensLoopError) {
-      // Network errors, timeouts, etc. - fall back to direct call
-      console.log(`[LocalGPU] Lens Loop proxy error: ${lensLoopError.message}, falling back to direct GPU call`);
+  // Convert messages to a single prompt for text generation
+  let prompt = '';
+  for (const msg of messages) {
+    if (msg.role === 'system') {
+      prompt += `<s>[INST] <<SYS>>\n${msg.content}\n<</SYS>>\n\n`;
+    } else if (msg.role === 'user') {
+      prompt += `${msg.content} [/INST]`;
+    } else if (msg.role === 'assistant') {
+      prompt += `${msg.content}</s><s>[INST] `;
     }
   }
 
-  // Direct Ollama API call (no observability, or fallback when Lens Loop unavailable)
-  console.log(`[LocalGPU] Calling ${LOCAL_GPU_MODEL} via Ollama`);
+  console.log(`[HuggingFace] Calling ${HUGGINGFACE_MODEL}`);
 
-  const response = await fetch(`${LOCAL_GPU_URL}/api/chat`, {
+  const response = await fetch(`https://api-inference.huggingface.co/models/${HUGGINGFACE_MODEL}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Authorization': `Bearer ${HUGGINGFACE_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
     body: JSON.stringify({
-      model: LOCAL_GPU_MODEL,
-      messages,
-      stream: false,
-      options: {
-        num_predict: maxTokens,
-        temperature
+      inputs: prompt,
+      parameters: {
+        max_new_tokens: maxTokens,
+        temperature: temperature,
+        return_full_text: false
       }
     }),
-    signal: AbortSignal.timeout(120000) // 2 min timeout
+    signal: AbortSignal.timeout(60000) // 60s timeout
   });
 
   if (!response.ok) {
     const error = await response.text();
-    throw new Error(`Local GPU error ${response.status}: ${error}`);
+    throw new Error(`HuggingFace error ${response.status}: ${error}`);
   }
 
   const data = await response.json();
-  const content = data.message?.content || '';
 
-  console.log(`[LocalGPU] ✓ Response received (${content.length} chars)`);
+  // HuggingFace returns array of generated texts
+  const content = Array.isArray(data)
+    ? data[0]?.generated_text || ''
+    : data.generated_text || '';
+
+  console.log(`[HuggingFace] ✓ Response received (${content.length} chars)`);
 
   return {
     response: content.trim(),
-    model: LOCAL_GPU_MODEL,
-    backend: 'local-gpu',
+    model: HUGGINGFACE_MODEL,
+    backend: 'huggingface',
     usage: {
-      prompt_tokens: data.prompt_eval_count,
-      completion_tokens: data.eval_count
+      prompt_tokens: 0,
+      completion_tokens: 0
     }
   };
 }
@@ -829,29 +789,29 @@ async function inference(prompt, options = {}) {
   }
 
   // Auto mode: smart 3-tier fallback with health checks
-  // Tier 1: Local GPU (free, fastest when available)
-  if (isLocalGpuConfigured()) {
-    const localGpuHealthy = await checkBackendHealth('localGpu');
-    backendGauge.set({ backend: 'marmoset-gpu' }, localGpuHealthy ? 1 : 0);
-    if (localGpuHealthy) {
+  // Tier 1: HuggingFace (fast, reliable, cheap)
+  if (isHuggingFaceConfigured()) {
+    const hfHealthy = await checkBackendHealth('huggingface');
+    backendGauge.set({ backend: 'huggingface' }, hfHealthy ? 1 : 0);
+    if (hfHealthy) {
       try {
-        console.log('[auto] Trying Local GPU (Tier 1)...');
-        const gpuResult = await instrumentedCall('marmoset-gpu', () => callLocalGpu(messages, { maxTokens, temperature }));
+        console.log('[auto] Trying HuggingFace (Tier 1)...');
+        const hfResult = await instrumentedCall('huggingface', () => callHuggingFace(messages, { maxTokens, temperature }));
         // Cache the result for low-temperature requests
         if (!skipCache && temperature <= 0.5) {
           const cacheKey = getCacheKey(prompt, { systemPrompt, maxTokens, backend });
-          await setInCache(cacheKey, gpuResult);
+          await setInCache(cacheKey, hfResult);
         }
-        return gpuResult;
+        return hfResult;
       } catch (error) {
-        console.warn(`[auto] Local GPU failed: ${error.message}`);
-        fallbackCounter.inc({ from_tier: 'marmoset-gpu', to_tier: 'vps-cpu', reason: 'error' });
+        console.warn(`[auto] HuggingFace failed: ${error.message}`);
+        fallbackCounter.inc({ from_tier: 'huggingface', to_tier: 'vps-cpu', reason: 'error' });
         // Mark as unhealthy to skip on next request
-        healthCache.localGpu = { status: 'unavailable', lastCheck: Date.now() };
+        healthCache.huggingface = { status: 'unavailable', lastCheck: Date.now() };
       }
     } else {
-      console.log('[auto] Local GPU unavailable, skipping Tier 1');
-      fallbackCounter.inc({ from_tier: 'marmoset-gpu', to_tier: 'vps-cpu', reason: 'unhealthy' });
+      console.log('[auto] HuggingFace unavailable, skipping Tier 1');
+      fallbackCounter.inc({ from_tier: 'huggingface', to_tier: 'vps-cpu', reason: 'unhealthy' });
     }
   }
 
@@ -972,30 +932,29 @@ app.get('/health', async (req, res) => {
       }
     },
     backends: {
-      // Tier 1: Local GPU (your GTX 1080)
-      localGpu: {
+      // Tier 1: HuggingFace Inference API
+      huggingface: {
         tier: 1,
-        configured: isLocalGpuConfigured(),
-        model: isLocalGpuConfigured() ? LOCAL_GPU_MODEL : null,
-        url: LOCAL_GPU_URL || 'not configured',
-        status: isLocalGpuConfigured() ? 'checking...' : 'not_configured',
-        description: 'GTX 1080 via Ollama + Cloudflare tunnel'
+        configured: isHuggingFaceConfigured(),
+        model: isHuggingFaceConfigured() ? HUGGINGFACE_MODEL : null,
+        status: isHuggingFaceConfigured() ? 'checking...' : 'not_configured',
+        description: 'HuggingFace Inference API (fast, reliable)'
       },
-      // Tier 2: RunPod GPU
-      runpod: {
-        tier: 2,
-        configured: isRunPodConfigured(),
-        model: isRunPodConfigured() ? RUNPOD_MODEL : null,
-        status: isRunPodConfigured() ? 'checking...' : 'not_configured',
-        description: 'RTX 4090 via RunPod Serverless'
-      },
-      // Tier 3: VPS CPU
+      // Tier 2: VPS CPU
       local: {
-        tier: 3,
+        tier: 2,
         model: LOCAL_MODEL,
         url: LOCAL_URL,
         status: 'checking...',
         description: 'Llama 3.2 3B on VPS CPU (always available)'
+      },
+      // Tier 3: RunPod GPU
+      runpod: {
+        tier: 3,
+        configured: isRunPodConfigured(),
+        model: isRunPodConfigured() ? RUNPOD_MODEL : null,
+        status: isRunPodConfigured() ? 'checking...' : 'not_configured',
+        description: 'RTX 4090 via RunPod Serverless (paid fallback)'
       },
       // External: Groq (free tier for education apps)
       groq: {
@@ -1009,27 +968,42 @@ app.get('/health', async (req, res) => {
     }
   };
 
-  // Check Tier 1: Local GPU health
-  if (isLocalGpuConfigured()) {
+  // Check Tier 1: HuggingFace health
+  if (isHuggingFaceConfigured()) {
     try {
-      const response = await fetch(`${LOCAL_GPU_URL}/api/tags`, {
-        method: 'GET',
-        signal: AbortSignal.timeout(3000)
+      // Simple health check - just verify API is reachable
+      const response = await fetch(`https://api-inference.huggingface.co/models/${HUGGINGFACE_MODEL}`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${HUGGINGFACE_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ inputs: 'test', parameters: { max_new_tokens: 1 } }),
+        signal: AbortSignal.timeout(5000)
       });
-      if (response.ok) {
-        const data = await response.json();
-        health.backends.localGpu.status = 'healthy';
-        health.backends.localGpu.models = data.models?.map(m => m.name) || [];
+      if (response.ok || response.status === 503) {
+        // 503 means model is loading, which is still "available"
+        health.backends.huggingface.status = response.status === 503 ? 'loading' : 'healthy';
       } else {
-        health.backends.localGpu.status = 'unhealthy';
+        health.backends.huggingface.status = 'unhealthy';
       }
     } catch (error) {
-      health.backends.localGpu.status = 'offline';
-      health.backends.localGpu.note = 'Your computer may be off or tunnel disconnected';
+      health.backends.huggingface.status = 'unavailable';
     }
   }
 
-  // Check Tier 2: RunPod health
+  // Check Tier 2: VPS CPU health
+  try {
+    const response = await fetch(`${LOCAL_URL}/health`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(5000)
+    });
+    health.backends.local.status = response.ok ? 'healthy' : 'unhealthy';
+  } catch (error) {
+    health.backends.local.status = 'unavailable';
+  }
+
+  // Check Tier 3: RunPod health
   if (isRunPodConfigured()) {
     try {
       const response = await fetch(`${RUNPOD_BASE_URL}/health`, {
@@ -1046,18 +1020,6 @@ app.get('/health', async (req, res) => {
     } catch (error) {
       health.backends.runpod.status = 'unavailable';
     }
-  }
-
-  // Check Tier 3: VPS CPU health
-  try {
-    const response = await fetch(`${LOCAL_URL}/health`, {
-      method: 'GET',
-      signal: AbortSignal.timeout(5000)
-    });
-    health.backends.local.status = response.ok ? 'healthy' : 'unhealthy';
-  } catch (error) {
-    health.backends.local.status = 'unavailable';
-    health.backends.local.error = error.message;
   }
 
   // Check Groq health (external API)
@@ -1077,59 +1039,60 @@ app.get('/health', async (req, res) => {
   }
 
   // Add embedding backends to health check
+  // Tier 1: VPS CPU Triton (always available), Tier 2: Local GPU Triton (optional)
   health.embedding = {
-    primary: {
+    vpsCpu: {
       tier: 1,
-      configured: isEmbeddingPrimaryConfigured(),
-      model: EMBEDDING_MODEL,
-      url: EMBEDDING_PRIMARY_URL || 'not configured',
-      status: 'checking...',
-      description: 'Local GPU Triton (bge_embeddings)'
-    },
-    fallback: {
-      tier: 2,
       model: EMBEDDING_MODEL,
       url: EMBEDDING_FALLBACK_URL,
       status: 'checking...',
       description: 'VPS CPU Triton (always available)'
+    },
+    localGpu: {
+      tier: 2,
+      configured: isEmbeddingPrimaryConfigured(),
+      model: EMBEDDING_MODEL,
+      url: EMBEDDING_PRIMARY_URL || 'not configured',
+      status: 'checking...',
+      description: 'Local GPU Triton (optional fallback)'
     }
   };
 
-  // Check embedding primary health
+  // Check Tier 1 embedding: VPS CPU Triton
+  try {
+    const response = await fetch(`${EMBEDDING_FALLBACK_URL}/v2/health/ready`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(5000)
+    });
+    health.embedding.vpsCpu.status = response.ok ? 'healthy' : 'unhealthy';
+  } catch (error) {
+    health.embedding.vpsCpu.status = 'unavailable';
+    health.embedding.vpsCpu.error = error.message;
+  }
+
+  // Check Tier 2 embedding: Local GPU Triton
   if (isEmbeddingPrimaryConfigured()) {
     try {
       const response = await fetch(`${EMBEDDING_PRIMARY_URL}/v2/health/ready`, {
         method: 'GET',
         signal: AbortSignal.timeout(5000)
       });
-      health.embedding.primary.status = response.ok ? 'healthy' : 'unhealthy';
+      health.embedding.localGpu.status = response.ok ? 'healthy' : 'unhealthy';
     } catch (error) {
-      health.embedding.primary.status = 'offline';
-      health.embedding.primary.note = 'Local GPU/tunnel may be down';
+      health.embedding.localGpu.status = 'offline';
+      health.embedding.localGpu.note = 'Local GPU/tunnel may be down';
     }
   } else {
-    health.embedding.primary.status = 'not_configured';
+    health.embedding.localGpu.status = 'not_configured';
   }
 
-  // Check embedding fallback health
-  try {
-    const response = await fetch(`${EMBEDDING_FALLBACK_URL}/v2/health/ready`, {
-      method: 'GET',
-      signal: AbortSignal.timeout(5000)
-    });
-    health.embedding.fallback.status = response.ok ? 'healthy' : 'unhealthy';
-  } catch (error) {
-    health.embedding.fallback.status = 'unavailable';
-    health.embedding.fallback.error = error.message;
-  }
-
-  // Determine active embedding backend
-  if (health.embedding.primary.status === 'healthy') {
-    health.activeEmbeddingBackend = 'primary';
-    health.activeEmbeddingDescription = 'Using Local GPU Triton';
-  } else if (health.embedding.fallback.status === 'healthy') {
-    health.activeEmbeddingBackend = 'fallback';
-    health.activeEmbeddingDescription = 'Using VPS CPU Triton';
+  // Determine active embedding backend (Tier 1: VPS CPU, Tier 2: Local GPU)
+  if (health.embedding.vpsCpu.status === 'healthy') {
+    health.activeEmbeddingBackend = 'vpsCpu';
+    health.activeEmbeddingDescription = 'Using VPS CPU Triton (Tier 1)';
+  } else if (health.embedding.localGpu.status === 'healthy') {
+    health.activeEmbeddingBackend = 'localGpu';
+    health.activeEmbeddingDescription = 'Using Local GPU Triton (Tier 2 fallback)';
   } else {
     health.activeEmbeddingBackend = 'none';
     health.activeEmbeddingDescription = 'No embedding backends available!';
@@ -1899,7 +1862,7 @@ async function callTritonEmbedding(url, texts) {
 
 /**
  * Unified embedding function - 2-tier fallback
- * Priority: Local GPU Triton → VPS CPU Triton
+ * Priority: VPS CPU Triton (always available) → Local GPU Triton (optional)
  */
 async function getEmbeddings(texts, options = {}) {
   const { forceBackend, skipCache = false } = options;
@@ -1916,58 +1879,69 @@ async function getEmbeddings(texts, options = {}) {
   }
 
   // Force specific backend
-  if (forceBackend === 'primary') {
-    if (!isEmbeddingPrimaryConfigured()) {
-      throw new Error('Primary embedding backend not configured');
-    }
-    const result = await instrumentedCall('marmoset-gpu-embed', () => callTritonEmbedding(EMBEDDING_PRIMARY_URL, texts), 'embedding');
-    return { ...result, backend: 'primary (Local GPU)', model: EMBEDDING_MODEL };
+  if (forceBackend === 'vps' || forceBackend === 'fallback') {
+    const result = await instrumentedCall('vps-cpu-embed', () => callTritonEmbedding(EMBEDDING_FALLBACK_URL, texts), 'embedding');
+    return { ...result, backend: 'VPS CPU Triton', model: EMBEDDING_MODEL };
   }
 
-  if (forceBackend === 'fallback') {
-    const result = await instrumentedCall('vps-cpu-embed', () => callTritonEmbedding(EMBEDDING_FALLBACK_URL, texts), 'embedding');
-    return { ...result, backend: 'fallback (VPS CPU)', model: EMBEDDING_MODEL };
+  if (forceBackend === 'local-gpu' || forceBackend === 'primary') {
+    if (!isEmbeddingPrimaryConfigured()) {
+      throw new Error('Local GPU embedding backend not configured');
+    }
+    const result = await instrumentedCall('local-gpu-embed', () => callTritonEmbedding(EMBEDDING_PRIMARY_URL, texts), 'embedding');
+    return { ...result, backend: 'Local GPU Triton', model: EMBEDDING_MODEL };
   }
 
   // Auto mode: 2-tier fallback
-  // Tier 1: Local GPU Triton
+  // Tier 1: VPS CPU Triton (always available)
+  const vpsHealthy = await checkEmbeddingHealth('fallback');
+  backendGauge.set({ backend: 'vps-cpu-embed' }, vpsHealthy ? 1 : 0);
+  if (vpsHealthy) {
+    try {
+      console.log('[Embedding] Trying VPS CPU Triton (Tier 1)...');
+      const result = await instrumentedCall('vps-cpu-embed', () => callTritonEmbedding(EMBEDDING_FALLBACK_URL, texts), 'embedding');
+
+      // Cache single text results
+      if (!skipCache && inputTexts.length === 1) {
+        const cacheKey = getCacheKey(inputTexts[0], { type: 'embedding', model: EMBEDDING_MODEL });
+        await setInCache(cacheKey, result, 86400); // 24 hour cache for embeddings
+      }
+
+      return { ...result, backend: 'VPS CPU Triton (Tier 1)', model: EMBEDDING_MODEL };
+    } catch (error) {
+      console.warn(`[Embedding] VPS CPU failed: ${error.message}`);
+      fallbackCounter.inc({ from_tier: 'vps-cpu-embed', to_tier: 'local-gpu-embed', reason: 'error' });
+      healthCache.embeddingFallback = { status: 'unavailable', lastCheck: Date.now() };
+    }
+  } else {
+    console.log('[Embedding] VPS CPU unavailable, skipping Tier 1');
+    fallbackCounter.inc({ from_tier: 'vps-cpu-embed', to_tier: 'local-gpu-embed', reason: 'unhealthy' });
+  }
+
+  // Tier 2: Local GPU Triton (fallback)
   if (isEmbeddingPrimaryConfigured()) {
-    const primaryHealthy = await checkEmbeddingHealth('primary');
-    backendGauge.set({ backend: 'marmoset-gpu-embed' }, primaryHealthy ? 1 : 0);
-    if (primaryHealthy) {
+    const localGpuHealthy = await checkEmbeddingHealth('primary');
+    backendGauge.set({ backend: 'local-gpu-embed' }, localGpuHealthy ? 1 : 0);
+    if (localGpuHealthy) {
       try {
-        console.log('[Embedding] Trying Local GPU Triton (Tier 1)...');
-        const result = await instrumentedCall('marmoset-gpu-embed', () => callTritonEmbedding(EMBEDDING_PRIMARY_URL, texts), 'embedding');
+        console.log('[Embedding] Falling back to Local GPU Triton (Tier 2)...');
+        const result = await instrumentedCall('local-gpu-embed', () => callTritonEmbedding(EMBEDDING_PRIMARY_URL, texts), 'embedding');
 
         // Cache single text results
         if (!skipCache && inputTexts.length === 1) {
           const cacheKey = getCacheKey(inputTexts[0], { type: 'embedding', model: EMBEDDING_MODEL });
-          await setInCache(cacheKey, result, 86400); // 24 hour cache for embeddings
+          await setInCache(cacheKey, result, 86400);
         }
 
-        return { ...result, backend: 'primary (Local GPU)', model: EMBEDDING_MODEL };
+        return { ...result, backend: 'Local GPU Triton (Tier 2)', model: EMBEDDING_MODEL };
       } catch (error) {
-        console.warn(`[Embedding] Primary failed: ${error.message}`);
-        fallbackCounter.inc({ from_tier: 'marmoset-gpu-embed', to_tier: 'vps-cpu-embed', reason: 'error' });
+        console.warn(`[Embedding] Local GPU failed: ${error.message}`);
         healthCache.embeddingPrimary = { status: 'unavailable', lastCheck: Date.now() };
       }
-    } else {
-      console.log('[Embedding] Primary unavailable, skipping Tier 1');
-      fallbackCounter.inc({ from_tier: 'marmoset-gpu-embed', to_tier: 'vps-cpu-embed', reason: 'unhealthy' });
     }
   }
 
-  // Tier 2: VPS CPU Triton
-  console.log('[Embedding] Falling back to VPS CPU Triton (Tier 2)...');
-  const result = await instrumentedCall('vps-cpu-embed', () => callTritonEmbedding(EMBEDDING_FALLBACK_URL, texts), 'embedding');
-
-  // Cache single text results
-  if (!skipCache && inputTexts.length === 1) {
-    const cacheKey = getCacheKey(inputTexts[0], { type: 'embedding', model: EMBEDDING_MODEL });
-    await setInCache(cacheKey, result, 86400);
-  }
-
-  return { ...result, backend: 'fallback (VPS CPU)', model: EMBEDDING_MODEL };
+  throw new Error('All embedding backends failed');
 }
 
 /**
