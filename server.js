@@ -148,7 +148,7 @@ const RUNPOD_BASE_URL = RUNPOD_ENDPOINT_ID
   : null;
 const RUNPOD_MODEL = process.env.RUNPOD_MODEL || 'meta-llama/Llama-3.1-8B-Instruct';
 
-// Backend preference: 'auto' (smart fallback), 'local-gpu', 'runpod', 'local'
+// Backend preference: 'auto' (smart fallback), 'huggingface', 'local', 'runpod'
 const BACKEND_PREFERENCE = process.env.BACKEND_PREFERENCE || 'auto';
 
 // =============================================================================
@@ -318,10 +318,11 @@ async function checkBackendHealth(backend) {
     let url, timeout = 3000;
 
     switch (backend) {
-      case 'localGpu':
-        if (!isLocalGpuConfigured()) return false;
-        url = `${LOCAL_GPU_URL}/api/tags`; // Ollama health endpoint
-        break;
+      case 'huggingface':
+        if (!isHuggingFaceConfigured()) return false;
+        // HuggingFace doesn't have a dedicated health endpoint, check if configured
+        healthCache[backend] = { status: 'healthy', lastCheck: now };
+        return true;
       case 'runpod':
         if (!isRunPodConfigured()) return false;
         url = `${RUNPOD_BASE_URL}/health`;
@@ -748,11 +749,11 @@ async function inference(prompt, options = {}) {
   messages.push({ role: 'user', content: prompt });
 
   // Force specific backend
-  if (backend === 'local-gpu') {
-    if (!isLocalGpuConfigured()) {
-      throw new Error('Local GPU requested but not configured');
+  if (backend === 'huggingface') {
+    if (!isHuggingFaceConfigured()) {
+      throw new Error('HuggingFace requested but not configured');
     }
-    return instrumentedCall('marmoset-gpu', () => callLocalGpu(messages, { maxTokens, temperature }));
+    return instrumentedCall('huggingface', () => callHuggingFace(messages, { maxTokens, temperature }));
   }
 
   if (backend === 'runpod') {
@@ -1460,11 +1461,11 @@ async function chatInference(messages, options = {}) {
   const backend = forceBackend || BACKEND_PREFERENCE;
 
   // Force specific backend
-  if (backend === 'local-gpu') {
-    if (!isLocalGpuConfigured()) {
-      throw new Error('Local GPU requested but not configured');
+  if (backend === 'huggingface') {
+    if (!isHuggingFaceConfigured()) {
+      throw new Error('HuggingFace requested but not configured');
     }
-    return instrumentedCall('marmoset-gpu', () => callLocalGpu(messages, { maxTokens, temperature }), 'chat');
+    return instrumentedCall('huggingface', () => callHuggingFace(messages, { maxTokens, temperature }), 'chat');
   }
 
   if (backend === 'runpod') {
@@ -1501,21 +1502,21 @@ async function chatInference(messages, options = {}) {
   }
 
   // Auto mode: smart 3-tier fallback with health checks
-  // Tier 1: Local GPU (free, fastest when available)
-  if (isLocalGpuConfigured()) {
-    const localGpuHealthy = await checkBackendHealth('localGpu');
-    backendGauge.set({ backend: 'marmoset-gpu' }, localGpuHealthy ? 1 : 0);
-    if (localGpuHealthy) {
+  // Tier 1: HuggingFace (fast, reliable)
+  if (isHuggingFaceConfigured()) {
+    const hfHealthy = await checkBackendHealth('huggingface');
+    backendGauge.set({ backend: 'huggingface' }, hfHealthy ? 1 : 0);
+    if (hfHealthy) {
       try {
-        console.log('[chat-auto] Trying Local GPU (Tier 1)...');
-        return await instrumentedCall('marmoset-gpu', () => callLocalGpu(messages, { maxTokens, temperature }), 'chat');
+        console.log('[chat-auto] Trying HuggingFace (Tier 1)...');
+        return await instrumentedCall('huggingface', () => callHuggingFace(messages, { maxTokens, temperature }), 'chat');
       } catch (error) {
-        console.warn(`[chat-auto] Local GPU failed: ${error.message}`);
-        fallbackCounter.inc({ from_tier: 'marmoset-gpu', to_tier: 'vps-cpu', reason: 'error' });
-        healthCache.localGpu = { status: 'unavailable', lastCheck: Date.now() };
+        console.warn(`[chat-auto] HuggingFace failed: ${error.message}`);
+        fallbackCounter.inc({ from_tier: 'huggingface', to_tier: 'vps-cpu', reason: 'error' });
+        healthCache.huggingface = { status: 'unavailable', lastCheck: Date.now() };
       }
     } else {
-      fallbackCounter.inc({ from_tier: 'marmoset-gpu', to_tier: 'vps-cpu', reason: 'unhealthy' });
+      fallbackCounter.inc({ from_tier: 'huggingface', to_tier: 'vps-cpu', reason: 'unhealthy' });
     }
   }
 
@@ -1999,19 +2000,19 @@ app.get('/', (req, res) => {
     version: '3.5.0',
     description: '3-Tier LLM + 2-Tier Embedding GPU Fallback System with Anthropic Claude + Redis Caching',
     backends: {
-      'tier1_localGpu': {
-        configured: isLocalGpuConfigured(),
-        model: isLocalGpuConfigured() ? LOCAL_GPU_MODEL : null,
-        description: 'GTX 1080 via Ollama (free, uses your PC when online)'
+      'tier1_huggingface': {
+        configured: isHuggingFaceConfigured(),
+        model: isHuggingFaceConfigured() ? HUGGINGFACE_MODEL : null,
+        description: 'HuggingFace Inference API (fast, reliable)'
       },
-      'tier2_runpod': {
+      'tier2_vpsCpu': {
+        model: LOCAL_MODEL,
+        description: 'Llama 3.2 3B on VPS CPU (always available)'
+      },
+      'tier3_runpod': {
         configured: isRunPodConfigured(),
         model: isRunPodConfigured() ? RUNPOD_MODEL : null,
-        description: 'RTX 4090 via RunPod Serverless (paid, cloud GPU)'
-      },
-      'tier3_local': {
-        model: LOCAL_MODEL,
-        description: 'Llama 3.2 3B on VPS CPU (always available fallback)'
+        description: 'RTX 4090 via RunPod Serverless (paid cloud fallback)'
       },
       'anthropic': {
         configured: isAnthropicConfigured(),
@@ -2021,16 +2022,16 @@ app.get('/', (req, res) => {
     },
     preference: BACKEND_PREFERENCE,
     embedding: {
-      'tier1_primary': {
-        configured: isEmbeddingPrimaryConfigured(),
-        model: EMBEDDING_MODEL,
-        url: EMBEDDING_PRIMARY_URL || 'not configured',
-        description: 'Local GPU Triton via Cloudflare tunnel'
-      },
-      'tier2_fallback': {
+      'tier1_vpsCpu': {
         model: EMBEDDING_MODEL,
         url: EMBEDDING_FALLBACK_URL,
         description: 'VPS CPU Triton (always available)'
+      },
+      'tier2_localGpu': {
+        configured: isEmbeddingPrimaryConfigured(),
+        model: EMBEDDING_MODEL,
+        url: EMBEDDING_PRIMARY_URL || 'not configured',
+        description: 'Local GPU Triton (optional fallback)'
       }
     },
     endpoints: {
@@ -2046,8 +2047,8 @@ app.get('/', (req, res) => {
       'GET /metrics': 'Prometheus metrics endpoint'
     },
     usage: {
-      backend_param: 'Add "backend": "local-gpu|runpod|local|anthropic|auto" to force a specific backend',
-      auto_mode: 'Default "auto" tries backends in order: local-gpu → runpod → local',
+      backend_param: 'Add "backend": "huggingface|local|runpod|anthropic|auto" to force a specific backend',
+      auto_mode: 'Default "auto" tries backends in order: huggingface → local (VPS CPU) → runpod',
       anthropic_mode: 'Use "backend": "anthropic" or "claude" for complex reasoning tasks (K8s analysis, debugging)'
     }
   });
@@ -2220,28 +2221,29 @@ app.listen(PORT, async () => {
 ${isLensLoopConfigured() ? `║   Proxy: ${LENS_LOOP_PROXY.substring(0, 47).padEnd(47)}║\n║   Project: ${LENS_LOOP_PROJECT.padEnd(45)}║\n` : ''}╠══════════════════════════════════════════════════════════╣
 ║   LLM BACKENDS (3-Tier Fallback)                         ║
 ╠══════════════════════════════════════════════════════════╣
-║   Tier 1: Local GPU (GTX 1080 via Ollama)                ║
-║     Configured: ${(isLocalGpuConfigured() ? 'Yes' : 'No').padEnd(40)}║
-${isLocalGpuConfigured() ? `║     URL: ${LOCAL_GPU_URL.substring(0, 47).padEnd(47)}║\n║     Model: ${LOCAL_GPU_MODEL.padEnd(45)}║\n` : ''}╠══════════════════════════════════════════════════════════╣
-║   Tier 2: RunPod GPU (RTX 4090 Serverless)               ║
-║     Configured: ${(isRunPodConfigured() ? 'Yes' : 'No').padEnd(40)}║
-${isRunPodConfigured() ? `║     Model: ${RUNPOD_MODEL.substring(0, 45).padEnd(45)}║\n` : ''}╠══════════════════════════════════════════════════════════╣
-║   Tier 3: VPS CPU (Always Available)                     ║
+║   Tier 1: HuggingFace Inference API                      ║
+║     Configured: ${(isHuggingFaceConfigured() ? 'Yes' : 'No').padEnd(40)}║
+${isHuggingFaceConfigured() ? `║     Model: ${HUGGINGFACE_MODEL.substring(0, 45).padEnd(45)}║\n` : ''}╠══════════════════════════════════════════════════════════╣
+║   Tier 2: VPS CPU (Always Available)                     ║
 ║     URL: ${LOCAL_URL.padEnd(47)}║
 ║     Model: ${LOCAL_MODEL.padEnd(45)}║
 ╠══════════════════════════════════════════════════════════╣
+║   Tier 3: RunPod GPU (RTX 4090 Serverless)               ║
+║     Configured: ${(isRunPodConfigured() ? 'Yes' : 'No').padEnd(40)}║
+${isRunPodConfigured() ? `║     Model: ${RUNPOD_MODEL.substring(0, 45).padEnd(45)}║\n` : ''}╠══════════════════════════════════════════════════════════╣
 ║   ANTHROPIC (Claude - Premium Reasoning)                 ║
 ╠══════════════════════════════════════════════════════════╣
 ║   Configured: ${(isAnthropicConfigured() ? 'Yes ✓' : 'No').padEnd(42)}║
 ${isAnthropicConfigured() ? `║   Model: ${ANTHROPIC_MODEL.padEnd(47)}║\n` : ''}╠══════════════════════════════════════════════════════════╣
 ║   EMBEDDING BACKENDS (2-Tier Fallback)                   ║
 ╠══════════════════════════════════════════════════════════╣
-║   Tier 1: Local GPU Triton (bge_embeddings)              ║
-║     Configured: ${(isEmbeddingPrimaryConfigured() ? 'Yes' : 'No').padEnd(40)}║
-${isEmbeddingPrimaryConfigured() ? `║     URL: ${EMBEDDING_PRIMARY_URL.substring(0, 47).padEnd(47)}║\n` : ''}╠══════════════════════════════════════════════════════════╣
-║   Tier 2: VPS CPU Triton (Always Available)              ║
+║   Tier 1: VPS CPU Triton (Always Available)              ║
 ║     URL: ${EMBEDDING_FALLBACK_URL.substring(0, 47).padEnd(47)}║
 ║     Model: ${EMBEDDING_MODEL.padEnd(45)}║
+╠══════════════════════════════════════════════════════════╣
+║   Tier 2: Local GPU Triton (Optional)                    ║
+║     Configured: ${(isEmbeddingPrimaryConfigured() ? 'Yes' : 'No').padEnd(40)}║
+${isEmbeddingPrimaryConfigured() ? `║     URL: ${EMBEDDING_PRIMARY_URL.substring(0, 47).padEnd(47)}║\n` : ''}
 ╚══════════════════════════════════════════════════════════╝
   `);
 });
