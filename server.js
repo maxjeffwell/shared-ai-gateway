@@ -255,6 +255,17 @@ if (isLensLoopConfigured() && ANTHROPIC_API_KEY) {
   console.log(`[Anthropic] Lens Loop enabled via LiteLLM: ${lensLoopBaseUrl}`);
 }
 
+// Initialize Claude client with direct LiteLLM for Langfuse observability
+// Used when Lens Loop is unavailable - routes directly to LiteLLM → Claude
+let claudeClientWithLiteLLM = null;
+if (LITELLM_URL && ANTHROPIC_API_KEY) {
+  claudeClientWithLiteLLM = new OpenAI({
+    apiKey: 'not-needed', // LiteLLM uses its own API key
+    baseURL: `${LITELLM_URL}/v1`
+  });
+  console.log(`[Anthropic] LiteLLM direct enabled for Langfuse: ${LITELLM_URL}/v1`);
+}
+
 // Initialize Groq client with Lens Loop for observability
 // Routes through Lens Loop → LiteLLM → Groq (same pattern as Claude)
 let groqClientWithLensLoop = null;
@@ -576,12 +587,48 @@ async function callAnthropic(messages, options = {}) {
         usage
       };
     } catch (lensLoopError) {
-      console.warn(`[Anthropic] Lens Loop error: ${lensLoopError.message}, falling back to native SDK`);
+      console.warn(`[Anthropic] Lens Loop error: ${lensLoopError.message}, trying LiteLLM direct...`);
     }
   }
 
-  // Fallback to native Anthropic SDK
-  console.log(`[Anthropic] Using native Anthropic SDK`);
+  // Try direct LiteLLM for Langfuse observability (when Lens Loop unavailable)
+  if (claudeClientWithLiteLLM) {
+    try {
+      console.log(`[Anthropic] Using LiteLLM direct for Langfuse observability`);
+
+      const openaiMessages = systemPrompt
+        ? [{ role: 'system', content: systemPrompt }, ...chatMessages]
+        : chatMessages;
+
+      const response = await claudeClientWithLiteLLM.chat.completions.create({
+        model: 'claude-sonnet', // LiteLLM model alias
+        messages: openaiMessages,
+        max_tokens: maxTokens,
+        temperature
+      });
+
+      const content = response.choices[0]?.message?.content || '';
+      const usage = {
+        prompt_tokens: response.usage?.prompt_tokens,
+        completion_tokens: response.usage?.completion_tokens
+      };
+
+      const durationMs = Date.now() - startTime;
+      console.log(`[Anthropic] ✓ Response via LiteLLM/Langfuse (${content.length} chars) in ${durationMs}ms`);
+
+      return {
+        response: content.trim(),
+        model: ANTHROPIC_MODEL,
+        backend: 'anthropic (langfuse)',
+        usage
+      };
+    } catch (litellmError) {
+      console.warn(`[Anthropic] LiteLLM error: ${litellmError.message}, falling back to native SDK`);
+    }
+  }
+
+  // Fallback to native Anthropic SDK (no tracing)
+  console.log(`[Anthropic] Using native Anthropic SDK (no tracing)`);
 
   const response = await anthropicClient.messages.create({
     model: ANTHROPIC_MODEL,
