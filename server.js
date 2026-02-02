@@ -274,6 +274,17 @@ if (isLensLoopConfigured() && GROQ_API_KEY) {
   console.log(`[Groq] Lens Loop enabled via LiteLLM: ${lensLoopGroqUrl}`);
 }
 
+// Initialize Groq client with direct LiteLLM for Langfuse observability
+// Used when Lens Loop is unavailable - routes directly to LiteLLM → Groq
+let groqClientWithLiteLLM = null;
+if (LITELLM_URL && GROQ_API_KEY) {
+  groqClientWithLiteLLM = new OpenAI({
+    apiKey: 'not-needed', // LiteLLM uses its own API key
+    baseURL: `${LITELLM_URL}/v1`
+  });
+  console.log(`[Groq] LiteLLM direct enabled for Langfuse: ${LITELLM_URL}/v1`);
+}
+
 /**
  * Check if RunPod is configured
  */
@@ -638,7 +649,36 @@ async function callGroq(messages, options = {}) {
         usage
       };
     } catch (lensLoopError) {
-      console.warn(`[Groq] Lens Loop error: ${lensLoopError.message}, falling back to direct API`);
+      console.warn(`[Groq] Lens Loop error: ${lensLoopError.message}, trying LiteLLM direct...`);
+    }
+  }
+
+  // Try direct LiteLLM for Langfuse observability (when Lens Loop unavailable)
+  if (groqClientWithLiteLLM) {
+    try {
+      console.log(`[Groq] Using LiteLLM direct for Langfuse observability`);
+
+      const response = await groqClientWithLiteLLM.chat.completions.create({
+        model: 'groq-llama', // LiteLLM model alias for Groq
+        messages,
+        max_tokens: maxTokens,
+        temperature
+      });
+
+      const content = response.choices?.[0]?.message?.content || '';
+      const usage = response.usage || {};
+      const durationMs = Date.now() - startTime;
+
+      console.log(`[Groq] ✓ Response via LiteLLM/Langfuse (${content.length} chars) in ${durationMs}ms`);
+
+      return {
+        response: content.trim(),
+        model: GROQ_MODEL,
+        backend: 'groq (langfuse)',
+        usage
+      };
+    } catch (litellmError) {
+      console.warn(`[Groq] LiteLLM error: ${litellmError.message}, falling back to direct API`);
     }
   }
 
