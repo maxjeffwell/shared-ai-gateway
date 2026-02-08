@@ -81,6 +81,12 @@ spec:
                 secretKeyRef:
                   name: ai-gateway-credentials
                   key: RUNPOD_ENDPOINT_ID
+            - name: KAFKA_ENABLED
+              value: "true"
+            - name: KAFKA_BROKERS
+              value: "vertex-kafka-kafka-bootstrap.microservices.svc:9092"
+            - name: KAFKA_AI_EVENTS_TOPIC
+              value: "ai.gateway.events"
           resources:
             requests:
               cpu: 100m
