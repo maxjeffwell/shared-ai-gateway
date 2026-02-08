@@ -7,6 +7,8 @@ import Redis from 'ioredis';
 import promClient from 'prom-client';
 import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
+import { initProducer, sendAIEvent, closeKafka, isKafkaConnected } from './kafka/producer.js';
+import { createAIEvent, createAIErrorEvent } from './kafka/AIEvent.js';
 
 dotenv.config();
 
@@ -66,6 +68,25 @@ if (CACHE_ENABLED) {
   } catch (err) {
     console.warn('[Redis] Failed to initialize:', err.message);
   }
+}
+
+// =============================================================================
+// KAFKA EVENT PRODUCER
+// =============================================================================
+if (process.env.KAFKA_ENABLED !== 'false') {
+  initProducer().catch(() => {
+    console.warn('[Kafka] Producer unavailable, events will not be published');
+  });
+}
+
+/** Emit an AI event to Kafka (fire-and-forget). */
+function emitAIEvent(endpoint, app, result, startTime) {
+  sendAIEvent(createAIEvent({ endpoint, app, result, latencyMs: Date.now() - startTime }));
+}
+
+/** Emit an error event to Kafka (fire-and-forget). */
+function emitAIError(endpoint, app, error, startTime) {
+  sendAIEvent(createAIErrorEvent({ endpoint, app, error, latencyMs: Date.now() - startTime }));
 }
 
 /**
@@ -1011,6 +1032,10 @@ app.get('/health', async (req, res) => {
     gateway: 'healthy',
     preference: BACKEND_PREFERENCE,
     cache: cacheStatus,
+    kafka: {
+      enabled: process.env.KAFKA_ENABLED !== 'false',
+      connected: isKafkaConnected(),
+    },
     observability: {
       lensLoop: {
         enabled: isLensLoopConfigured(),
@@ -1236,6 +1261,7 @@ app.get('/health', async (req, res) => {
  * }
  */
 app.post('/api/ai/generate', async (req, res) => {
+  const startTime = Date.now();
   try {
     const {
       prompt,
@@ -1275,6 +1301,7 @@ app.post('/api/ai/generate', async (req, res) => {
     }
 
     console.log(`[${app}] ✓ Generation complete via ${result.backend} (${result.response.length} chars)`);
+    emitAIEvent('generate', app, result, startTime);
 
     res.json({
       success: true,
@@ -1287,6 +1314,7 @@ app.post('/api/ai/generate', async (req, res) => {
 
   } catch (error) {
     console.error('Generate error:', error.message);
+    emitAIError('generate', req.body?.app, error, startTime);
     res.status(500).json({
       error: 'Generation failed',
       message: error.message
@@ -1307,6 +1335,7 @@ app.post('/api/ai/generate', async (req, res) => {
  * }
  */
 app.post('/api/ai/tags', async (req, res) => {
+  const startTime = Date.now();
   try {
     const { title, url, description = '', useAI = false } = req.body;
 
@@ -1340,6 +1369,7 @@ app.post('/api/ai/tags', async (req, res) => {
 
       const tags = parseTags(result.response, title);
       console.log(`[bookmarks] ✓ AI generated ${tags.length} tags via ${result.backend}:`, tags);
+      emitAIEvent('tags', 'bookmarks', result, startTime);
 
       return res.json({
         success: true,
@@ -1397,6 +1427,7 @@ app.post('/api/ai/tags', async (req, res) => {
  * }
  */
 app.post('/api/ai/explain-code', async (req, res) => {
+  const startTime = Date.now();
   try {
     const { code, language = 'unknown', backend } = req.body;
 
@@ -1417,6 +1448,7 @@ app.post('/api/ai/explain-code', async (req, res) => {
     );
 
     console.log(`[code] ✓ Explanation generated via ${result.backend}`);
+    emitAIEvent('explain-code', 'code-talk', result, startTime);
 
     res.json({
       success: true,
@@ -1429,6 +1461,7 @@ app.post('/api/ai/explain-code', async (req, res) => {
 
   } catch (error) {
     console.error('Code explanation error:', error.message);
+    emitAIError('explain-code', 'code-talk', error, startTime);
     res.status(500).json({
       error: 'Code explanation failed',
       message: error.message
@@ -1448,6 +1481,7 @@ app.post('/api/ai/explain-code', async (req, res) => {
  * }
  */
 app.post('/api/ai/flashcard', async (req, res) => {
+  const startTime = Date.now();
   try {
     const { topic, content, backend } = req.body;
 
@@ -1478,6 +1512,7 @@ app.post('/api/ai/flashcard', async (req, res) => {
     answer = answer.replace(/^Answer:\s*/i, '');
 
     console.log(`[flashcard] ✓ Flashcard generated via ${result.backend}`);
+    emitAIEvent('flashcard', 'educationelly', result, startTime);
 
     res.json({
       success: true,
@@ -1490,6 +1525,7 @@ app.post('/api/ai/flashcard', async (req, res) => {
 
   } catch (error) {
     console.error('Flashcard generation error:', error.message);
+    emitAIError('flashcard', 'educationelly', error, startTime);
     res.status(500).json({
       error: 'Flashcard generation failed',
       message: error.message
@@ -1510,6 +1546,7 @@ app.post('/api/ai/flashcard', async (req, res) => {
  * }
  */
 app.post('/api/ai/quiz', async (req, res) => {
+  const startTime = Date.now();
   try {
     const { topic, difficulty = 'medium', count = 3, backend } = req.body;
 
@@ -1532,6 +1569,7 @@ app.post('/api/ai/quiz', async (req, res) => {
     const questions = parseQuizQuestions(result.response);
 
     console.log(`[quiz] ✓ Generated ${questions.length} questions via ${result.backend}`);
+    emitAIEvent('quiz', 'educationelly', result, startTime);
 
     res.json({
       success: true,
@@ -1545,6 +1583,7 @@ app.post('/api/ai/quiz', async (req, res) => {
 
   } catch (error) {
     console.error('Quiz generation error:', error.message);
+    emitAIError('quiz', 'educationelly', error, startTime);
     res.status(500).json({
       error: 'Quiz generation failed',
       message: error.message
@@ -1674,6 +1713,7 @@ async function chatInference(messages, options = {}) {
  * }
  */
 app.post('/api/ai/chat', async (req, res) => {
+  const startTime = Date.now();
   try {
     const {
       messages = [],
@@ -1758,6 +1798,7 @@ and encourage effective learning habits. Be concise and supportive.`;
     }
 
     console.log(`[chat] ✓ Response generated via ${result.backend} (${result.response.length} chars)`);
+    emitAIEvent('chat', context.app || 'general', result, startTime);
 
     res.json({
       success: true,
@@ -1769,6 +1810,7 @@ and encourage effective learning habits. Be concise and supportive.`;
 
   } catch (error) {
     console.error('Chat error:', error.message);
+    emitAIError('chat', req.body?.context?.app, error, startTime);
     res.status(500).json({
       error: 'Chat failed',
       message: error.message
@@ -1789,6 +1831,7 @@ and encourage effective learning habits. Be concise and supportive.`;
  * }
  */
 app.post('/api/ai/describe', async (req, res) => {
+  const startTime = Date.now();
   try {
     const { title, url, existingDescription, backend } = req.body;
 
@@ -1834,6 +1877,7 @@ app.post('/api/ai/describe', async (req, res) => {
     description = description.replace(/^["']|["']$/g, '').trim();
 
     console.log(`[describe] ✓ Description generated via ${result.backend}`);
+    emitAIEvent('describe', 'bookmarks', result, startTime);
 
     res.json({
       success: true,
@@ -2058,6 +2102,7 @@ async function getEmbeddings(texts, options = {}) {
  * }
  */
 app.post('/api/ai/embed', async (req, res) => {
+  const startTime = Date.now();
   try {
     const { text, texts, backend } = req.body;
 
@@ -2072,6 +2117,7 @@ app.post('/api/ai/embed', async (req, res) => {
     const result = await getEmbeddings(input, { forceBackend: backend });
 
     console.log(`[embed] ✓ Embeddings generated via ${result.backend} (${result.dimensions} dimensions)`);
+    emitAIEvent('embed', 'general', result, startTime);
 
     res.json({
       success: true,
@@ -2084,6 +2130,7 @@ app.post('/api/ai/embed', async (req, res) => {
 
   } catch (error) {
     console.error('Embedding error:', error.message);
+    emitAIError('embed', 'general', error, startTime);
     res.status(500).json({
       error: 'Embedding generation failed',
       message: error.message
@@ -2347,4 +2394,10 @@ ${isAnthropicConfigured() ? `║   Model: ${ANTHROPIC_MODEL.padEnd(47)}║\n` : 
 ${isEmbeddingPrimaryConfigured() ? `║     URL: ${EMBEDDING_PRIMARY_URL.substring(0, 47).padEnd(47)}║\n` : ''}
 ╚══════════════════════════════════════════════════════════╝
   `);
+});
+
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received, shutting down...');
+  await closeKafka();
+  process.exit(0);
 });
