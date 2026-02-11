@@ -6,35 +6,46 @@ let producer = null;
 const KAFKA_TOPIC = process.env.KAFKA_AI_EVENTS_TOPIC || 'ai.gateway.events';
 
 /**
- * Initialize Kafka producer with graceful degradation.
- * Returns null if connection fails (gateway continues without events).
+ * Initialize Kafka producer with retry loop.
+ * Retries indefinitely with exponential backoff so the gateway
+ * self-heals if Kafka starts after this pod.
  */
 export async function initProducer() {
-  try {
-    const brokers = process.env.KAFKA_BROKERS
-      ? process.env.KAFKA_BROKERS.split(',')
-      : ['vertex-kafka-kafka-bootstrap.microservices.svc:9092'];
-    const clientId = process.env.KAFKA_CLIENT_ID || 'shared-ai-gateway';
+  const brokers = process.env.KAFKA_BROKERS
+    ? process.env.KAFKA_BROKERS.split(',')
+    : ['vertex-kafka-kafka-bootstrap.microservices.svc:9092'];
+  const clientId = process.env.KAFKA_CLIENT_ID || 'shared-ai-gateway';
 
-    kafka = new Kafka({
-      clientId,
-      brokers,
-      logLevel: logLevel.ERROR,
-      retry: { initialRetryTime: 100, retries: 8 },
-    });
+  kafka = new Kafka({
+    clientId,
+    brokers,
+    logLevel: logLevel.ERROR,
+    retry: { initialRetryTime: 300, retries: 8 },
+  });
 
-    producer = kafka.producer({
-      allowAutoTopicCreation: false,
-      transactionTimeout: 30000,
-    });
+  producer = kafka.producer({
+    allowAutoTopicCreation: false,
+    transactionTimeout: 30000,
+  });
 
-    await producer.connect();
-    console.log('[Kafka] Producer connected', { clientId, brokers });
-    return producer;
-  } catch (error) {
-    console.warn('[Kafka] Producer unavailable:', error.message);
-    producer = null;
-    return null;
+  const maxDelay = 30_000;
+  let delay = 2_000;
+  while (true) {
+    try {
+      await producer.connect();
+      console.log('[Kafka] Producer connected', { clientId, brokers });
+      return producer;
+    } catch (error) {
+      console.warn(`[Kafka] Producer connect failed: ${error.message}, retrying in ${delay}ms`);
+      producer = null;
+      await new Promise((r) => setTimeout(r, delay));
+      delay = Math.min(delay * 2, maxDelay);
+      // Recreate producer — KafkaJS doesn't reliably reconnect after exhausting internal retries
+      producer = kafka.producer({
+        allowAutoTopicCreation: false,
+        transactionTimeout: 30000,
+      });
+    }
   }
 }
 
