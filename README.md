@@ -17,8 +17,8 @@ Node.js/Express API gateway (v3.5) providing LLM inference and embeddings to all
                     │  (fallback)  │     │  Backends       │
                     └──────────────┘     └─────────────────┘
                     │                    │
-  Tier 1: HuggingFace Inference API     Tier 1: VPS CPU Triton (bge_embeddings)
-  Tier 2: VPS CPU (llama.cpp)           Tier 2: Local GPU Triton (via tunnel)
+  Tier 1: HuggingFace Inference API     Tier 1: Local GPU Triton (bge_embeddings)
+  Tier 2: VPS CPU (llama.cpp)           Tier 2: VPS CPU Triton (fallback)
   Tier 3: RunPod GPU Serverless
   Groq:   Free tier (select apps)
   Claude: Premium (complex reasoning)
@@ -56,7 +56,7 @@ In `auto` mode, the gateway health-checks each tier and falls back down the chai
 |:---------|:--------|:-----------|
 | `POST /api/ai/embed` | Generate text embeddings | `texts` (array) |
 
-2-tier fallback: VPS CPU Triton → Local GPU Triton.
+2-tier fallback: Local GPU Triton → VPS CPU Triton.
 
 ### System
 
@@ -115,8 +115,8 @@ GROQ_API_KEY=
 GROQ_MODEL=llama-3.3-70b-versatile
 
 # Embeddings
-EMBEDDING_FALLBACK_URL=http://triton-embeddings:8000
-EMBEDDING_PRIMARY_URL=  # optional local GPU Triton
+EMBEDDING_PRIMARY_URL=  # local GPU Triton (Tier 1, e.g. https://embeddings.el-jefe.me)
+EMBEDDING_FALLBACK_URL=http://triton-embeddings:8000  # VPS CPU Triton (Tier 2)
 EMBEDDING_MODEL=bge_embeddings
 
 # Redis
