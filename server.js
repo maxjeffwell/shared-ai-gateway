@@ -2463,6 +2463,27 @@ function parseQuizQuestions(text) {
 }
 
 // Start server
+// Warmup backends on startup - sends a small inference to prime connections and model caches
+async function warmupBackends() {
+  const warmupPrompt = [{ role: 'user', content: 'Hi' }];
+  const backends = [
+    { name: 'localGpu', fn: () => callLocalGpu(warmupPrompt, { maxTokens: 1 }) },
+    { name: 'local', fn: () => callLocal(warmupPrompt, { maxTokens: 1 }) },
+  ];
+
+  console.log('[Warmup] Warming up LLM backends...');
+  for (const { name, fn } of backends) {
+    try {
+      const start = Date.now();
+      await fn();
+      console.log(`[Warmup] ${name} ready (${Date.now() - start}ms)`);
+    } catch (err) {
+      console.log(`[Warmup] ${name} not available: ${err.message}`);
+    }
+  }
+  console.log('[Warmup] Backend warmup complete');
+}
+
 app.listen(PORT, async () => {
   // Try to connect to Redis on startup
   if (redis && CACHE_ENABLED) {
@@ -2472,6 +2493,9 @@ app.listen(PORT, async () => {
       // Already connected or will connect lazily
     }
   }
+
+  // Warmup backends after startup (non-blocking)
+  warmupBackends().catch(() => {});
 
   console.log(`
 ╔══════════════════════════════════════════════════════════╗
