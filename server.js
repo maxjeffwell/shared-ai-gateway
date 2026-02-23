@@ -141,27 +141,33 @@ const app = express();
 const PORT = process.env.PORT || 8002;
 
 // =============================================================================
-// BACKEND CONFIGURATION - 3-Tier Fallback System
+// LLM INFERENCE BACKEND CONFIGURATION - 4-Tier Fallback
 // =============================================================================
-// Priority 1: HuggingFace Inference API (fast, reliable, cheap)
-// Priority 2: VPS CPU (llama-3b - always available fallback)
-// Priority 3: RunPod GPU (cloud RTX 4090 - serverless, pay-per-use)
+// Tier 1: Local GPU - Ollama on GTX 1080 via Cloudflare tunnel (free, fastest)
+// Tier 2: VPS CPU - llama.cpp server (free, always available)
+// Tier 3: HuggingFace Router - OpenAI-compatible API (free)
+// Tier 4: RunPod GPU - RTX 4090 serverless (paid, last resort)
 // =============================================================================
 
-// Tier 1: HuggingFace Inference API
+// Tier 1: Local GPU - Ollama via Cloudflare tunnel (optional, like embedding primary)
+const LOCAL_GPU_URL = process.env.LOCAL_GPU_URL; // e.g., https://gpu.el-jefe.me
+const LOCAL_GPU_MODEL = process.env.LOCAL_GPU_MODEL || 'llama3.2:3b-instruct-q4_K_M';
+
+// Tier 2: HuggingFace Inference API (migrated to router.huggingface.co)
 const HUGGINGFACE_API_KEY = process.env.HUGGINGFACE_API_KEY;
-const HUGGINGFACE_MODEL = process.env.HF_MODEL || 'mistralai/Mistral-7B-Instruct-v0.3';
+const HUGGINGFACE_MODEL = process.env.HF_MODEL || 'meta-llama/Llama-3.1-8B-Instruct';
+const HF_BASE_URL = 'https://router.huggingface.co/v1';
 
 // Lens Loop Observability - proxy for LLM tracing (optional)
 // When enabled, routes requests through Lens Loop for observability
 const LENS_LOOP_PROXY = process.env.LENS_LOOP_PROXY; // e.g., http://host.docker.internal:31300
 const LENS_LOOP_PROJECT = process.env.LENS_LOOP_PROJECT || 'lens-loop-project';
 
-// Tier 2: VPS CPU - Llama 3.2 3B via llama.cpp server (always available)
+// Tier 3: VPS CPU - Llama 3.2 3B via llama.cpp server (always available)
 const LOCAL_URL = process.env.LOCAL_URL || 'http://llama-3b-service:8080';
 const LOCAL_MODEL = 'llama-3.2-3b-instruct';
 
-// Tier 3: RunPod GPU - Llama 3.1 8B on RTX 4090 (cloud, serverless)
+// Tier 4: RunPod GPU - Llama 3.1 8B on RTX 4090 (cloud, serverless)
 const RUNPOD_API_KEY = process.env.RUNPOD_API_KEY;
 const RUNPOD_ENDPOINT_ID = process.env.RUNPOD_ENDPOINT_ID;
 const RUNPOD_BASE_URL = RUNPOD_ENDPOINT_ID
@@ -230,6 +236,7 @@ if (GROQ_API_KEY) {
 
 // Health check cache (avoid hammering backends)
 const healthCache = {
+  localGpu: { status: 'unknown', lastCheck: 0 },
   huggingface: { status: 'unknown', lastCheck: 0 },
   runpod: { status: 'unknown', lastCheck: 0 },
   local: { status: 'unknown', lastCheck: 0 },
@@ -248,6 +255,13 @@ const INFERENCE_URL = process.env.INFERENCE_URL || LOCAL_URL;
  */
 function isHuggingFaceConfigured() {
   return !!HUGGINGFACE_API_KEY;
+}
+
+/**
+ * Check if Local GPU (Ollama) is configured
+ */
+function isLocalGpuConfigured() {
+  return !!LOCAL_GPU_URL;
 }
 
 /**
@@ -361,11 +375,14 @@ async function checkBackendHealth(backend) {
     let url, timeout = 3000;
 
     switch (backend) {
+      case 'localGpu':
+        if (!isLocalGpuConfigured()) return false;
+        url = LOCAL_GPU_URL;
+        break;
       case 'huggingface':
         if (!isHuggingFaceConfigured()) return false;
-        // HuggingFace doesn't have a dedicated health endpoint, check if configured
-        healthCache[backend] = { status: 'healthy', lastCheck: now };
-        return true;
+        url = `${HF_BASE_URL}/models`;
+        break;
       case 'runpod':
         if (!isRunPodConfigured()) return false;
         url = `${RUNPOD_BASE_URL}/health`;
@@ -391,6 +408,10 @@ async function checkBackendHealth(backend) {
       options.headers = { 'Authorization': `Bearer ${RUNPOD_API_KEY}` };
     }
 
+    if (backend === 'huggingface') {
+      options.headers = { 'Authorization': `Bearer ${HUGGINGFACE_API_KEY}` };
+    }
+
     const response = await fetch(url, options);
     const healthy = response.ok;
 
@@ -400,6 +421,50 @@ async function checkBackendHealth(backend) {
     healthCache[backend] = { status: 'unavailable', lastCheck: now };
     return false;
   }
+}
+
+/**
+ * Call Local GPU Ollama via Cloudflare tunnel
+ * Uses OpenAI-compatible /v1/chat/completions endpoint
+ * Tier 1: Fastest inference (GTX 1080 GPU)
+ */
+async function callLocalGpu(messages, options = {}) {
+  if (!isLocalGpuConfigured()) {
+    throw new Error('Local GPU not configured');
+  }
+
+  const { maxTokens = 512, temperature = 0.7 } = options;
+
+  console.log(`[LocalGPU] Calling ${LOCAL_GPU_MODEL} via ${LOCAL_GPU_URL}`);
+
+  const response = await fetch(`${LOCAL_GPU_URL}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: LOCAL_GPU_MODEL,
+      messages,
+      max_tokens: maxTokens,
+      temperature
+    }),
+    signal: AbortSignal.timeout(30000)
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Local GPU inference failed: ${response.status} - ${error}`);
+  }
+
+  const data = await response.json();
+  const content = data.choices?.[0]?.message?.content || '';
+
+  console.log(`[LocalGPU] ✓ Response received (${content.length} chars)`);
+
+  return {
+    response: content,
+    model: LOCAL_GPU_MODEL,
+    backend: 'local-gpu',
+    usage: data.usage
+  };
 }
 
 /**
@@ -413,35 +478,21 @@ async function callHuggingFace(messages, options = {}) {
 
   const { maxTokens = 1024, temperature = 0.7 } = options;
 
-  // Convert messages to a single prompt for text generation
-  let prompt = '';
-  for (const msg of messages) {
-    if (msg.role === 'system') {
-      prompt += `<s>[INST] <<SYS>>\n${msg.content}\n<</SYS>>\n\n`;
-    } else if (msg.role === 'user') {
-      prompt += `${msg.content} [/INST]`;
-    } else if (msg.role === 'assistant') {
-      prompt += `${msg.content}</s><s>[INST] `;
-    }
-  }
+  console.log(`[HuggingFace] Calling ${HUGGINGFACE_MODEL} via router`);
 
-  console.log(`[HuggingFace] Calling ${HUGGINGFACE_MODEL}`);
-
-  const response = await fetch(`https://router.huggingface.co/hf-inference/models/${HUGGINGFACE_MODEL}`, {
+  const response = await fetch(`${HF_BASE_URL}/chat/completions`, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${HUGGINGFACE_API_KEY}`,
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
-      inputs: prompt,
-      parameters: {
-        max_new_tokens: maxTokens,
-        temperature: temperature,
-        return_full_text: false
-      }
+      model: HUGGINGFACE_MODEL,
+      messages,
+      max_tokens: maxTokens,
+      temperature
     }),
-    signal: AbortSignal.timeout(60000) // 60s timeout
+    signal: AbortSignal.timeout(60000)
   });
 
   if (!response.ok) {
@@ -450,11 +501,7 @@ async function callHuggingFace(messages, options = {}) {
   }
 
   const data = await response.json();
-
-  // HuggingFace returns array of generated texts
-  const content = Array.isArray(data)
-    ? data[0]?.generated_text || ''
-    : data.generated_text || '';
+  const content = data.choices?.[0]?.message?.content || '';
 
   console.log(`[HuggingFace] ✓ Response received (${content.length} chars)`);
 
@@ -462,10 +509,7 @@ async function callHuggingFace(messages, options = {}) {
     response: content.trim(),
     model: HUGGINGFACE_MODEL,
     backend: 'huggingface',
-    usage: {
-      prompt_tokens: 0,
-      completion_tokens: 0
-    }
+    usage: data.usage || { prompt_tokens: 0, completion_tokens: 0 }
   };
 }
 
@@ -897,30 +941,35 @@ async function inference(prompt, options = {}) {
     return instrumentedCall('vps-cpu', () => callLocal(messages, { maxTokens, temperature }));
   }
 
-  // Auto mode: smart 3-tier fallback with health checks
-  // Tier 1: HuggingFace (fast, reliable, cheap)
-  if (isHuggingFaceConfigured()) {
-    const hfHealthy = await checkBackendHealth('huggingface');
-    backendGauge.set({ backend: 'huggingface' }, hfHealthy ? 1 : 0);
-    if (hfHealthy) {
+  if (backend === 'local-gpu') {
+    if (!isLocalGpuConfigured()) {
+      throw new Error('Local GPU requested but not configured');
+    }
+    return instrumentedCall('local-gpu', () => callLocalGpu(messages, { maxTokens, temperature }));
+  }
+
+  // Auto mode: smart 4-tier fallback with health checks
+  // Tier 1: Local GPU (Ollama via Cloudflare tunnel - free, fastest)
+  if (isLocalGpuConfigured()) {
+    const gpuHealthy = await checkBackendHealth('localGpu');
+    backendGauge.set({ backend: 'local-gpu' }, gpuHealthy ? 1 : 0);
+    if (gpuHealthy) {
       try {
-        console.log('[auto] Trying HuggingFace (Tier 1)...');
-        const hfResult = await instrumentedCall('huggingface', () => callHuggingFace(messages, { maxTokens, temperature }));
-        // Cache the result for low-temperature requests
+        console.log('[auto] Trying Local GPU (Tier 1)...');
+        const gpuResult = await instrumentedCall('local-gpu', () => callLocalGpu(messages, { maxTokens, temperature }));
         if (!skipCache && temperature <= 0.5) {
           const cacheKey = getCacheKey(prompt, { systemPrompt, maxTokens, backend });
-          await setInCache(cacheKey, hfResult);
+          await setInCache(cacheKey, gpuResult);
         }
-        return hfResult;
+        return gpuResult;
       } catch (error) {
-        console.warn(`[auto] HuggingFace failed: ${error.message}`);
-        fallbackCounter.inc({ from_tier: 'huggingface', to_tier: 'vps-cpu', reason: 'error' });
-        // Mark as unhealthy to skip on next request
-        healthCache.huggingface = { status: 'unavailable', lastCheck: Date.now() };
+        console.warn(`[auto] Local GPU failed: ${error.message}`);
+        fallbackCounter.inc({ from_tier: 'local-gpu', to_tier: 'vps-cpu', reason: 'error' });
+        healthCache.localGpu = { status: 'unavailable', lastCheck: Date.now() };
       }
     } else {
-      console.log('[auto] HuggingFace unavailable, skipping Tier 1');
-      fallbackCounter.inc({ from_tier: 'huggingface', to_tier: 'vps-cpu', reason: 'unhealthy' });
+      console.log('[auto] Local GPU unavailable, skipping Tier 1');
+      fallbackCounter.inc({ from_tier: 'local-gpu', to_tier: 'vps-cpu', reason: 'unhealthy' });
     }
   }
 
@@ -931,7 +980,6 @@ async function inference(prompt, options = {}) {
     try {
       console.log('[auto] Trying VPS CPU (Tier 2)...');
       const localResult = await instrumentedCall('vps-cpu', () => callLocal(messages, { maxTokens, temperature }));
-      // Cache the result for low-temperature requests
       if (!skipCache && temperature <= 0.5) {
         const cacheKey = getCacheKey(prompt, { systemPrompt, maxTokens, backend });
         await setInCache(cacheKey, localResult);
@@ -939,19 +987,42 @@ async function inference(prompt, options = {}) {
       return localResult;
     } catch (error) {
       console.warn(`[auto] VPS CPU failed: ${error.message}`);
-      fallbackCounter.inc({ from_tier: 'vps-cpu', to_tier: 'runpod', reason: 'error' });
+      fallbackCounter.inc({ from_tier: 'vps-cpu', to_tier: 'huggingface', reason: 'error' });
     }
   } else {
     console.log('[auto] VPS CPU unavailable, skipping Tier 2');
-    fallbackCounter.inc({ from_tier: 'vps-cpu', to_tier: 'runpod', reason: 'unhealthy' });
+    fallbackCounter.inc({ from_tier: 'vps-cpu', to_tier: 'huggingface', reason: 'unhealthy' });
   }
 
-  // Tier 3: RunPod GPU (paid cloud fallback)
+  // Tier 3: HuggingFace (free cloud inference)
+  if (isHuggingFaceConfigured()) {
+    const hfHealthy = await checkBackendHealth('huggingface');
+    backendGauge.set({ backend: 'huggingface' }, hfHealthy ? 1 : 0);
+    if (hfHealthy) {
+      try {
+        console.log('[auto] Trying HuggingFace (Tier 3)...');
+        const hfResult = await instrumentedCall('huggingface', () => callHuggingFace(messages, { maxTokens, temperature }));
+        if (!skipCache && temperature <= 0.5) {
+          const cacheKey = getCacheKey(prompt, { systemPrompt, maxTokens, backend });
+          await setInCache(cacheKey, hfResult);
+        }
+        return hfResult;
+      } catch (error) {
+        console.warn(`[auto] HuggingFace failed: ${error.message}`);
+        fallbackCounter.inc({ from_tier: 'huggingface', to_tier: 'runpod', reason: 'error' });
+        healthCache.huggingface = { status: 'unavailable', lastCheck: Date.now() };
+      }
+    } else {
+      console.log('[auto] HuggingFace unavailable, skipping Tier 3');
+      fallbackCounter.inc({ from_tier: 'huggingface', to_tier: 'runpod', reason: 'unhealthy' });
+    }
+  }
+
+  // Tier 4: RunPod GPU (paid cloud fallback)
   if (isRunPodConfigured()) {
     try {
-      console.log('[auto] Trying RunPod GPU (Tier 3)...');
+      console.log('[auto] Trying RunPod GPU (Tier 4)...');
       const runpodResult = await instrumentedCall('runpod', () => callRunPod(messages, { maxTokens, temperature }));
-      // Cache the result for low-temperature requests
       if (!skipCache && temperature <= 0.5) {
         const cacheKey = getCacheKey(prompt, { systemPrompt, maxTokens, backend });
         await setInCache(cacheKey, runpodResult);
@@ -1045,13 +1116,14 @@ app.get('/health', async (req, res) => {
       }
     },
     backends: {
-      // Tier 1: HuggingFace Inference API
-      huggingface: {
+      // Tier 1: Local GPU (Ollama via Cloudflare tunnel)
+      localGpu: {
         tier: 1,
-        configured: isHuggingFaceConfigured(),
-        model: isHuggingFaceConfigured() ? HUGGINGFACE_MODEL : null,
-        status: isHuggingFaceConfigured() ? 'checking...' : 'not_configured',
-        description: 'HuggingFace Inference API (fast, reliable)'
+        configured: isLocalGpuConfigured(),
+        model: isLocalGpuConfigured() ? LOCAL_GPU_MODEL : null,
+        url: LOCAL_GPU_URL || 'not configured',
+        status: isLocalGpuConfigured() ? 'checking...' : 'not_configured',
+        description: 'Local GPU Ollama via Cloudflare tunnel (fastest, free)'
       },
       // Tier 2: VPS CPU
       local: {
@@ -1061,9 +1133,17 @@ app.get('/health', async (req, res) => {
         status: 'checking...',
         description: 'Llama 3.2 3B on VPS CPU (always available)'
       },
-      // Tier 3: RunPod GPU
-      runpod: {
+      // Tier 3: HuggingFace Inference API
+      huggingface: {
         tier: 3,
+        configured: isHuggingFaceConfigured(),
+        model: isHuggingFaceConfigured() ? HUGGINGFACE_MODEL : null,
+        status: isHuggingFaceConfigured() ? 'checking...' : 'not_configured',
+        description: 'HuggingFace Inference API (fast, reliable)'
+      },
+      // Tier 4: RunPod GPU
+      runpod: {
+        tier: 4,
         configured: isRunPodConfigured(),
         model: isRunPodConfigured() ? RUNPOD_MODEL : null,
         status: isRunPodConfigured() ? 'checking...' : 'not_configured',
@@ -1081,27 +1161,17 @@ app.get('/health', async (req, res) => {
     }
   };
 
-  // Check Tier 1: HuggingFace health
-  if (isHuggingFaceConfigured()) {
+  // Check Tier 1: Local GPU (Ollama)
+  if (isLocalGpuConfigured()) {
     try {
-      // Simple health check - just verify API is reachable
-      const response = await fetch(`https://router.huggingface.co/hf-inference/models/${HUGGINGFACE_MODEL}`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${HUGGINGFACE_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ inputs: 'test', parameters: { max_new_tokens: 1 } }),
+      const response = await fetch(LOCAL_GPU_URL, {
+        method: 'GET',
         signal: AbortSignal.timeout(5000)
       });
-      if (response.ok || response.status === 503) {
-        // 503 means model is loading, which is still "available"
-        health.backends.huggingface.status = response.status === 503 ? 'loading' : 'healthy';
-      } else {
-        health.backends.huggingface.status = 'unhealthy';
-      }
+      health.backends.localGpu.status = response.ok ? 'healthy' : 'unhealthy';
     } catch (error) {
-      health.backends.huggingface.status = 'unavailable';
+      health.backends.localGpu.status = 'offline';
+      health.backends.localGpu.note = 'Local GPU/tunnel may be down';
     }
   }
 
@@ -1116,7 +1186,21 @@ app.get('/health', async (req, res) => {
     health.backends.local.status = 'unavailable';
   }
 
-  // Check Tier 3: RunPod health
+  // Check Tier 3: HuggingFace health
+  if (isHuggingFaceConfigured()) {
+    try {
+      const response = await fetch(`${HF_BASE_URL}/models`, {
+        method: 'GET',
+        headers: { 'Authorization': `Bearer ${HUGGINGFACE_API_KEY}` },
+        signal: AbortSignal.timeout(5000)
+      });
+      health.backends.huggingface.status = response.ok ? 'healthy' : 'unhealthy';
+    } catch (error) {
+      health.backends.huggingface.status = 'unavailable';
+    }
+  }
+
+  // Check Tier 4: RunPod health
   if (isRunPodConfigured()) {
     try {
       const response = await fetch(`${RUNPOD_BASE_URL}/health`, {
@@ -1219,17 +1303,20 @@ app.get('/health', async (req, res) => {
     description: 'Claude API for complex reasoning (K8s analysis, debugging)'
   };
 
-  // Determine active backend (what would be used for next request)
-  // Tier order: HuggingFace → VPS CPU → RunPod
-  if (health.backends.huggingface.status === 'healthy') {
-    health.activeBackend = 'huggingface';
-    health.activeDescription = 'Using HuggingFace Inference API (fast, cheap)';
+  // Determine active backend
+  // Tier order: Local GPU → VPS CPU → HuggingFace → RunPod
+  if (health.backends.localGpu?.status === 'healthy') {
+    health.activeBackend = 'localGpu';
+    health.activeDescription = 'Using Local GPU Ollama (Tier 1, fastest)';
   } else if (health.backends.local.status === 'healthy') {
     health.activeBackend = 'local';
-    health.activeDescription = 'Using VPS CPU (slow but reliable)';
+    health.activeDescription = 'Using VPS CPU (Tier 2, reliable)';
+  } else if (health.backends.huggingface.status === 'healthy') {
+    health.activeBackend = 'huggingface';
+    health.activeDescription = 'Using HuggingFace Router (Tier 3, free cloud)';
   } else if (health.backends.runpod.status === 'healthy') {
     health.activeBackend = 'runpod';
-    health.activeDescription = 'Using RunPod RTX 4090 (paid)';
+    health.activeDescription = 'Using RunPod RTX 4090 (Tier 4, paid)';
   } else {
     health.activeBackend = 'none';
     health.activeDescription = 'No backends available!';
@@ -1237,6 +1324,7 @@ app.get('/health', async (req, res) => {
 
   // Overall status
   const healthyCount = [
+    health.backends.localGpu?.status,
     health.backends.huggingface.status,
     health.backends.local.status,
     health.backends.runpod.status
@@ -1641,22 +1729,29 @@ async function chatInference(messages, options = {}) {
     return instrumentedCall('vps-cpu', () => callLocal(messages, { maxTokens, temperature }), 'chat');
   }
 
-  // Auto mode: smart 3-tier fallback with health checks
-  // Tier 1: HuggingFace (fast, reliable)
-  if (isHuggingFaceConfigured()) {
-    const hfHealthy = await checkBackendHealth('huggingface');
-    backendGauge.set({ backend: 'huggingface' }, hfHealthy ? 1 : 0);
-    if (hfHealthy) {
+  if (backend === 'local-gpu') {
+    if (!isLocalGpuConfigured()) {
+      throw new Error('Local GPU requested but not configured');
+    }
+    return instrumentedCall('local-gpu', () => callLocalGpu(messages, { maxTokens, temperature }), 'chat');
+  }
+
+  // Auto mode: smart 4-tier fallback with health checks
+  // Tier 1: Local GPU (Ollama via Cloudflare tunnel)
+  if (isLocalGpuConfigured()) {
+    const gpuHealthy = await checkBackendHealth('localGpu');
+    backendGauge.set({ backend: 'local-gpu' }, gpuHealthy ? 1 : 0);
+    if (gpuHealthy) {
       try {
-        console.log('[chat-auto] Trying HuggingFace (Tier 1)...');
-        return await instrumentedCall('huggingface', () => callHuggingFace(messages, { maxTokens, temperature }), 'chat');
+        console.log('[chat-auto] Trying Local GPU (Tier 1)...');
+        return await instrumentedCall('local-gpu', () => callLocalGpu(messages, { maxTokens, temperature }), 'chat');
       } catch (error) {
-        console.warn(`[chat-auto] HuggingFace failed: ${error.message}`);
-        fallbackCounter.inc({ from_tier: 'huggingface', to_tier: 'vps-cpu', reason: 'error' });
-        healthCache.huggingface = { status: 'unavailable', lastCheck: Date.now() };
+        console.warn(`[chat-auto] Local GPU failed: ${error.message}`);
+        fallbackCounter.inc({ from_tier: 'local-gpu', to_tier: 'vps-cpu', reason: 'error' });
+        healthCache.localGpu = { status: 'unavailable', lastCheck: Date.now() };
       }
     } else {
-      fallbackCounter.inc({ from_tier: 'huggingface', to_tier: 'vps-cpu', reason: 'unhealthy' });
+      fallbackCounter.inc({ from_tier: 'local-gpu', to_tier: 'vps-cpu', reason: 'unhealthy' });
     }
   }
 
@@ -1669,16 +1764,34 @@ async function chatInference(messages, options = {}) {
       return await instrumentedCall('vps-cpu', () => callLocal(messages, { maxTokens, temperature }), 'chat');
     } catch (error) {
       console.warn(`[chat-auto] VPS CPU failed: ${error.message}`);
-      fallbackCounter.inc({ from_tier: 'vps-cpu', to_tier: 'runpod', reason: 'error' });
+      fallbackCounter.inc({ from_tier: 'vps-cpu', to_tier: 'huggingface', reason: 'error' });
     }
   } else {
-    fallbackCounter.inc({ from_tier: 'vps-cpu', to_tier: 'runpod', reason: 'unhealthy' });
+    fallbackCounter.inc({ from_tier: 'vps-cpu', to_tier: 'huggingface', reason: 'unhealthy' });
   }
 
-  // Tier 3: RunPod GPU (paid cloud fallback)
+  // Tier 3: HuggingFace (free cloud)
+  if (isHuggingFaceConfigured()) {
+    const hfHealthy = await checkBackendHealth('huggingface');
+    backendGauge.set({ backend: 'huggingface' }, hfHealthy ? 1 : 0);
+    if (hfHealthy) {
+      try {
+        console.log('[chat-auto] Trying HuggingFace (Tier 3)...');
+        return await instrumentedCall('huggingface', () => callHuggingFace(messages, { maxTokens, temperature }), 'chat');
+      } catch (error) {
+        console.warn(`[chat-auto] HuggingFace failed: ${error.message}`);
+        fallbackCounter.inc({ from_tier: 'huggingface', to_tier: 'runpod', reason: 'error' });
+        healthCache.huggingface = { status: 'unavailable', lastCheck: Date.now() };
+      }
+    } else {
+      fallbackCounter.inc({ from_tier: 'huggingface', to_tier: 'runpod', reason: 'unhealthy' });
+    }
+  }
+
+  // Tier 4: RunPod GPU (paid cloud fallback)
   if (isRunPodConfigured()) {
     try {
-      console.log('[chat-auto] Trying RunPod GPU (Tier 3)...');
+      console.log('[chat-auto] Trying RunPod GPU (Tier 4)...');
       return await instrumentedCall('runpod', () => callRunPod(messages, { maxTokens, temperature }), 'chat');
     } catch (error) {
       console.warn(`[chat-auto] RunPod failed: ${error.message}`);
@@ -2145,19 +2258,25 @@ app.post('/api/ai/embed', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'Shared AI Gateway',
-    version: '3.5.0',
-    description: '3-Tier LLM + 2-Tier Embedding GPU Fallback System with Anthropic Claude + Redis Caching',
+    version: '4.0.0',
+    description: '4-Tier LLM + 2-Tier Embedding GPU Fallback System with Anthropic Claude + Redis Caching',
     backends: {
-      'tier1_huggingface': {
-        configured: isHuggingFaceConfigured(),
-        model: isHuggingFaceConfigured() ? HUGGINGFACE_MODEL : null,
-        description: 'HuggingFace Inference API (fast, reliable)'
+      'tier1_localGpu': {
+        configured: isLocalGpuConfigured(),
+        model: isLocalGpuConfigured() ? LOCAL_GPU_MODEL : null,
+        url: LOCAL_GPU_URL || 'not configured',
+        description: 'Local GPU Ollama via Cloudflare tunnel (fastest, free)'
       },
       'tier2_vpsCpu': {
         model: LOCAL_MODEL,
         description: 'Llama 3.2 3B on VPS CPU (always available)'
       },
-      'tier3_runpod': {
+      'tier3_huggingface': {
+        configured: isHuggingFaceConfigured(),
+        model: isHuggingFaceConfigured() ? HUGGINGFACE_MODEL : null,
+        description: 'HuggingFace Inference API (fast, reliable)'
+      },
+      'tier4_runpod': {
         configured: isRunPodConfigured(),
         model: isRunPodConfigured() ? RUNPOD_MODEL : null,
         description: 'RTX 4090 via RunPod Serverless (paid cloud fallback)'
@@ -2195,8 +2314,8 @@ app.get('/', (req, res) => {
       'GET /metrics': 'Prometheus metrics endpoint'
     },
     usage: {
-      backend_param: 'Add "backend": "huggingface|local|runpod|anthropic|auto" to force a specific backend',
-      auto_mode: 'Default "auto" tries backends in order: huggingface → local (VPS CPU) → runpod',
+      backend_param: 'Add "backend": "localGpu|local|huggingface|runpod|anthropic|auto" to force a specific backend',
+      auto_mode: 'Default "auto" tries backends in order: localGpu → local (VPS CPU) → huggingface → runpod',
       anthropic_mode: 'Use "backend": "anthropic" or "claude" for complex reasoning tasks (K8s analysis, debugging)'
     }
   });
@@ -2356,7 +2475,7 @@ app.listen(PORT, async () => {
 
   console.log(`
 ╔══════════════════════════════════════════════════════════╗
-║   Shared AI Gateway v3.5 - LLM + Embeddings + Claude     ║
+║   Shared AI Gateway v4.0 - LLM + Embeddings + Claude     ║
 ╠══════════════════════════════════════════════════════════╣
 ║   Port: ${PORT.toString().padEnd(48)}║
 ║   Mode: ${BACKEND_PREFERENCE.padEnd(49)}║
@@ -2367,16 +2486,19 @@ app.listen(PORT, async () => {
 ╠══════════════════════════════════════════════════════════╣
 ║   Tracing: ${(isLensLoopConfigured() ? 'Enabled ✓' : 'Disabled').padEnd(45)}║
 ${isLensLoopConfigured() ? `║   Proxy: ${LENS_LOOP_PROXY.substring(0, 47).padEnd(47)}║\n║   Project: ${LENS_LOOP_PROJECT.padEnd(45)}║\n` : ''}╠══════════════════════════════════════════════════════════╣
-║   LLM BACKENDS (3-Tier Fallback)                         ║
+║   LLM BACKENDS (4-Tier Fallback)                         ║
 ╠══════════════════════════════════════════════════════════╣
-║   Tier 1: HuggingFace Inference API                      ║
-║     Configured: ${(isHuggingFaceConfigured() ? 'Yes' : 'No').padEnd(40)}║
-${isHuggingFaceConfigured() ? `║     Model: ${HUGGINGFACE_MODEL.substring(0, 45).padEnd(45)}║\n` : ''}╠══════════════════════════════════════════════════════════╣
+║   Tier 1: Local GPU (Ollama via Cloudflare Tunnel)       ║
+║     Configured: ${(isLocalGpuConfigured() ? 'Yes' : 'No').padEnd(40)}║
+${isLocalGpuConfigured() ? `║     URL: ${LOCAL_GPU_URL.substring(0, 47).padEnd(47)}║\n║     Model: ${LOCAL_GPU_MODEL.substring(0, 45).padEnd(45)}║\n` : ''}╠══════════════════════════════════════════════════════════╣
 ║   Tier 2: VPS CPU (Always Available)                     ║
 ║     URL: ${LOCAL_URL.padEnd(47)}║
 ║     Model: ${LOCAL_MODEL.padEnd(45)}║
 ╠══════════════════════════════════════════════════════════╣
-║   Tier 3: RunPod GPU (RTX 4090 Serverless)               ║
+║   Tier 3: HuggingFace Router API                         ║
+║     Configured: ${(isHuggingFaceConfigured() ? 'Yes' : 'No').padEnd(40)}║
+${isHuggingFaceConfigured() ? `║     Model: ${HUGGINGFACE_MODEL.substring(0, 45).padEnd(45)}║\n` : ''}╠══════════════════════════════════════════════════════════╣
+║   Tier 4: RunPod GPU (RTX 4090 Serverless)               ║
 ║     Configured: ${(isRunPodConfigured() ? 'Yes' : 'No').padEnd(40)}║
 ${isRunPodConfigured() ? `║     Model: ${RUNPOD_MODEL.substring(0, 45).padEnd(45)}║\n` : ''}╠══════════════════════════════════════════════════════════╣
 ║   ANTHROPIC (Claude - Premium Reasoning)                 ║
