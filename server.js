@@ -1084,6 +1084,15 @@ app.get('/metrics', async (req, res) => {
 });
 
 /**
+ * Lightweight liveness probe - confirms the process is responsive.
+ * Unlike /health, this does NOT call external backends, so it always
+ * returns quickly regardless of downstream latency.
+ */
+app.get('/livez', (req, res) => {
+  res.json({ status: 'ok' });
+});
+
+/**
  * Health check endpoint - shows 3-tier backend status
  */
 app.get('/health', async (req, res) => {
