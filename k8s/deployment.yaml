@@ -93,6 +93,13 @@ spec:
               value: "vertex-kafka-kafka-bootstrap.microservices.svc:9092"
             - name: KAFKA_AI_EVENTS_TOPIC
               value: "ai.gateway.events"
+            - name: LUNARY_API_URL
+              value: "http://lunary-backend.lunary.svc.cluster.local:3333"
+            - name: LUNARY_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ai-gateway-credentials
+                  key: LUNARY_PUBLIC_KEY
           resources:
             requests:
               cpu: 100m
@@ -164,3 +171,36 @@ spec:
       ports:
         - protocol: TCP
           port: 8002
+---
+# Allow gateway to send trace/thread events to Lunary backend
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gateway-to-lunary
+  labels:
+    app: shared-ai-gateway
+    component: ai-gateway
+    tier: ai
+spec:
+  podSelector:
+    matchLabels:
+      app: shared-ai-gateway
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: lunary
+      ports:
+        - protocol: TCP
+          port: 3333
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

@@ -9,6 +9,15 @@ import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import { initProducer, sendAIEvent, closeKafka, isKafkaConnected } from './kafka/producer.js';
 import { createAIEvent, createAIErrorEvent } from './kafka/AIEvent.js';
+import {
+  generateRunId,
+  startTrace,
+  endTrace,
+  errorTrace,
+  trackChatMessage,
+  buildLiteLLMMetadata,
+  isLunaryConfigured
+} from './lunary.js';
 
 dotenv.config();
 
@@ -600,7 +609,7 @@ async function callAnthropic(messages, options = {}) {
   }
 
   const startTime = Date.now();
-  const { maxTokens = 1024, temperature = 0.7 } = options;
+  const { maxTokens = 1024, temperature = 0.7, lunaryMetadata } = options;
 
   // Extract system message if present (for native SDK)
   let systemPrompt = '';
@@ -629,12 +638,13 @@ async function callAnthropic(messages, options = {}) {
         ? [{ role: 'system', content: systemPrompt }, ...chatMessages]
         : chatMessages;
 
+      const requestOptions = lunaryMetadata ? { body: { metadata: lunaryMetadata } } : undefined;
       const response = await openaiClientForClaude.chat.completions.create({
         model: 'claude-sonnet', // LiteLLM model alias
         messages: openaiMessages,
         max_tokens: maxTokens,
         temperature
-      });
+      }, requestOptions);
 
       const content = response.choices[0]?.message?.content || '';
       const usage = {
@@ -665,12 +675,13 @@ async function callAnthropic(messages, options = {}) {
         ? [{ role: 'system', content: systemPrompt }, ...chatMessages]
         : chatMessages;
 
+      const litellmRequestOptions = lunaryMetadata ? { body: { metadata: lunaryMetadata } } : undefined;
       const response = await claudeClientWithLiteLLM.chat.completions.create({
         model: 'claude-sonnet', // LiteLLM model alias
         messages: openaiMessages,
         max_tokens: maxTokens,
         temperature
-      });
+      }, litellmRequestOptions);
 
       const content = response.choices[0]?.message?.content || '';
       const usage = {
@@ -726,7 +737,7 @@ async function callAnthropic(messages, options = {}) {
  * Routes through Lens Loop for observability when configured
  */
 async function callGroq(messages, options = {}) {
-  const { maxTokens = 2048, temperature = 0.7 } = options;
+  const { maxTokens = 2048, temperature = 0.7, lunaryMetadata } = options;
 
   if (!groqClient) {
     throw new Error('Groq client not initialized - missing GROQ_API_KEY');
@@ -741,12 +752,13 @@ async function callGroq(messages, options = {}) {
     try {
       console.log(`[Groq] Using Lens Loop → LiteLLM for observability`);
 
+      const groqLensLoopOptions = lunaryMetadata ? { body: { metadata: lunaryMetadata } } : undefined;
       const response = await groqClientWithLensLoop.chat.completions.create({
         model: 'groq-llama', // LiteLLM model alias for Groq
         messages,
         max_tokens: maxTokens,
         temperature
-      });
+      }, groqLensLoopOptions);
 
       const content = response.choices?.[0]?.message?.content || '';
       const usage = response.usage || {};
@@ -770,12 +782,13 @@ async function callGroq(messages, options = {}) {
     try {
       console.log(`[Groq] Using LiteLLM direct for Lunary observability`);
 
+      const groqLitellmOptions = lunaryMetadata ? { body: { metadata: lunaryMetadata } } : undefined;
       const response = await groqClientWithLiteLLM.chat.completions.create({
         model: 'groq-llama', // LiteLLM model alias for Groq
         messages,
         max_tokens: maxTokens,
         temperature
-      });
+      }, groqLitellmOptions);
 
       const content = response.choices?.[0]?.message?.content || '';
       const usage = response.usage || {};
@@ -1693,7 +1706,7 @@ app.post('/api/ai/quiz', async (req, res) => {
  * Used for conversational endpoints where history matters
  */
 async function chatInference(messages, options = {}) {
-  const { maxTokens = 512, temperature = 0.7, forceBackend, skipCache = true } = options;
+  const { maxTokens = 512, temperature = 0.7, forceBackend, skipCache = true, lunaryMetadata } = options;
 
   const backend = forceBackend || BACKEND_PREFERENCE;
 
@@ -1717,18 +1730,18 @@ async function chatInference(messages, options = {}) {
       // Anthropic not configured, try Groq as fallback
       if (isGroqConfigured()) {
         console.log('[chat] Anthropic not configured, using Groq fallback');
-        return instrumentedCall('groq', () => callGroq(messages, { maxTokens, temperature }), 'chat');
+        return instrumentedCall('groq', () => callGroq(messages, { maxTokens, temperature, lunaryMetadata }), 'chat');
       }
       throw new Error('Anthropic requested but not configured (Groq fallback also unavailable)');
     }
     // Try Anthropic, fallback to Groq on failure
     try {
-      return await instrumentedCall('anthropic', () => callAnthropic(messages, { maxTokens, temperature }), 'chat');
+      return await instrumentedCall('anthropic', () => callAnthropic(messages, { maxTokens, temperature, lunaryMetadata }), 'chat');
     } catch (anthropicError) {
       if (isGroqConfigured()) {
         console.warn(`[chat] Anthropic failed: ${anthropicError.message}, falling back to Groq`);
         fallbackCounter.inc({ from_tier: 'anthropic', to_tier: 'groq', reason: 'error' });
-        return await instrumentedCall('groq', () => callGroq(messages, { maxTokens, temperature }), 'chat');
+        return await instrumentedCall('groq', () => callGroq(messages, { maxTokens, temperature, lunaryMetadata }), 'chat');
       }
       throw anthropicError;
     }
@@ -1827,22 +1840,32 @@ async function chatInference(messages, options = {}) {
  *     "app": "educationelly",
  *     "userRole": "teacher",
  *     "gradeLevel": 5,
- *     "ellStatus": "LEP"
+ *     "ellStatus": "LEP",
+ *     "userId": "user-123"
  *   },
  *   "maxTokens": 512,
  *   "temperature": 0.7,
- *   "backend": "auto"
+ *   "backend": "auto",
+ *   "threadId": "optional-stable-conversation-id"
  * }
+ *
+ * Lunary observability:
+ * - Each request creates a parent "agent" trace in Lunary
+ * - LLM calls (via LiteLLM) become child runs of that trace
+ * - If threadId is provided, messages are tracked as a Lunary thread/conversation
+ * - Apps should generate a stable threadId per conversation and pass it on each request
  */
 app.post('/api/ai/chat', async (req, res) => {
   const startTime = Date.now();
+  const traceId = generateRunId();
   try {
     const {
       messages = [],
       context = {},
       maxTokens = 512,
       temperature = 0.7,
-      backend
+      backend,
+      threadId
     } = req.body;
 
     if (!messages || messages.length === 0) {
@@ -1891,21 +1914,40 @@ and encourage effective learning habits. Be concise and supportive.`;
       ];
     }
 
-    console.log(`[chat] Processing ${messages.length} messages (context: ${context.app || 'general'})`);
+    const app = context.app || 'general';
+    const userId = context.userId;
+    console.log(`[chat] Processing ${messages.length} messages (context: ${app})`);
+
+    // Build Lunary metadata for LiteLLM to forward to Lunary callback
+    const lunaryMetadata = buildLiteLLMMetadata({ traceId, app, userId, threadId });
+
+    // Start parent agent trace in Lunary (LLM run becomes child via parent_run_id)
+    const lastUserMessage = [...messages].reverse().find(m => m.role === 'user');
+    startTrace({
+      traceId,
+      app,
+      userId,
+      input: lastUserMessage?.content || messages[messages.length - 1]?.content,
+    });
+
+    // Track the user's message in the thread (if threadId provided)
+    if (threadId && lastUserMessage) {
+      trackChatMessage({ threadId, role: 'user', content: lastUserMessage.content, app, userId });
+    }
 
     let result;
 
     // Route to Groq for specific apps (free tier alternative to Claude)
-    if (shouldUseGroq(context.app)) {
-      console.log(`[chat] Routing ${context.app} to Groq backend`);
+    if (shouldUseGroq(app)) {
+      console.log(`[chat] Routing ${app} to Groq backend`);
       try {
-        result = await callGroq(fullMessages, { maxTokens, temperature });
+        result = await callGroq(fullMessages, { maxTokens, temperature, lunaryMetadata });
       } catch (groqError) {
         // Fallback to Anthropic if Groq rate limits (429) or fails
         if (groqError.message.includes('429') || groqError.message.includes('rate limit')) {
           console.log(`[chat] Groq rate limited, falling back to Anthropic`);
           fallbackCounter.inc({ from_tier: 'groq', to_tier: 'anthropic', reason: 'rate_limit' });
-          result = await callAnthropic(fullMessages, { maxTokens, temperature });
+          result = await callAnthropic(fullMessages, { maxTokens, temperature, lunaryMetadata });
         } else {
           throw groqError;
         }
@@ -1915,12 +1957,28 @@ and encourage effective learning habits. Be concise and supportive.`;
       result = await chatInference(fullMessages, {
         maxTokens,
         temperature,
-        forceBackend: backend
+        forceBackend: backend,
+        lunaryMetadata
       });
     }
 
     console.log(`[chat] ✓ Response generated via ${result.backend} (${result.response.length} chars)`);
-    emitAIEvent('chat', context.app || 'general', result, startTime);
+    emitAIEvent('chat', app, result, startTime);
+
+    // End the parent agent trace with the response
+    endTrace({
+      traceId,
+      output: result.response,
+      tokensUsage: result.usage ? {
+        prompt: result.usage.prompt_tokens,
+        completion: result.usage.completion_tokens,
+      } : undefined,
+    });
+
+    // Track the assistant's response in the thread
+    if (threadId) {
+      trackChatMessage({ threadId, role: 'assistant', content: result.response, app, userId });
+    }
 
     res.json({
       success: true,
@@ -1933,6 +1991,7 @@ and encourage effective learning habits. Be concise and supportive.`;
   } catch (error) {
     console.error('Chat error:', error.message);
     emitAIError('chat', req.body?.context?.app, error, startTime);
+    errorTrace({ traceId, error });
     res.status(500).json({
       error: 'Chat failed',
       message: error.message
