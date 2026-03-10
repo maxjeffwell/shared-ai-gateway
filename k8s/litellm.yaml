@@ -21,10 +21,6 @@ data:
         litellm_params:
           model: anthropic/claude-sonnet-4-20250514
           api_key: "os.environ/ANTHROPIC_API_KEY"
-      - model_name: claude-3-5-sonnet
-        litellm_params:
-          model: anthropic/claude-3-5-sonnet-20241022
-          api_key: "os.environ/ANTHROPIC_API_KEY"
       # Groq models (for code-talk, educationelly apps)
       - model_name: groq-llama
         litellm_params:
@@ -38,6 +34,8 @@ data:
     litellm_settings:
       drop_params: true
       set_verbose: false
+      success_callback: ["lunary"]
+      failure_callback: ["lunary"]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -61,6 +59,19 @@ spec:
         portfolio: "true"
         tier: ai
     spec:
+      initContainers:
+        - name: install-lunary
+          image: ghcr.io/berriai/litellm:main-latest
+          command: ["pip", "install", "--target=/opt/lunary", "lunary"]
+          volumeMounts:
+            - name: lunary-pkg
+              mountPath: /opt/lunary
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
       containers:
         - name: litellm
           image: ghcr.io/berriai/litellm:main-latest
@@ -74,6 +85,8 @@ spec:
               name: http
               protocol: TCP
           env:
+            - name: PYTHONPATH
+              value: "/opt/lunary"
             - name: ANTHROPIC_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -84,6 +97,13 @@ spec:
                 secretKeyRef:
                   name: groq-credentials
                   key: api-key
+            - name: LUNARY_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ai-gateway-credentials
+                  key: LUNARY_PUBLIC_KEY
+            - name: LUNARY_API_URL
+              value: "http://lunary-backend.lunary.svc.cluster.local:3333"
           resources:
             requests:
               cpu: 100m
@@ -95,6 +115,8 @@ spec:
             - name: config
               mountPath: /app/config.yaml
               subPath: config.yaml
+            - name: lunary-pkg
+              mountPath: /opt/lunary
           livenessProbe:
             httpGet:
               path: /health/liveliness  # Don't use /health - it makes real API calls!
@@ -113,6 +135,8 @@ spec:
         - name: config
           configMap:
             name: litellm-config
+        - name: lunary-pkg
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
