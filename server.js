@@ -290,7 +290,7 @@ if (isLensLoopConfigured() && ANTHROPIC_API_KEY) {
   console.log(`[Anthropic] Lens Loop enabled via LiteLLM: ${lensLoopBaseUrl}`);
 }
 
-// Initialize Claude client with direct LiteLLM for Langfuse observability
+// Initialize Claude client with direct LiteLLM for Lunary observability
 // Used when Lens Loop is unavailable - routes directly to LiteLLM → Claude
 let claudeClientWithLiteLLM = null;
 if (LITELLM_URL && ANTHROPIC_API_KEY) {
@@ -298,7 +298,7 @@ if (LITELLM_URL && ANTHROPIC_API_KEY) {
     apiKey: 'not-needed', // LiteLLM uses its own API key
     baseURL: `${LITELLM_URL}/v1`
   });
-  console.log(`[Anthropic] LiteLLM direct enabled for Langfuse: ${LITELLM_URL}/v1`);
+  console.log(`[Anthropic] LiteLLM direct enabled for Lunary: ${LITELLM_URL}/v1`);
 }
 
 // Initialize Groq client with Lens Loop for observability
@@ -320,7 +320,7 @@ if (isLensLoopConfigured() && GROQ_API_KEY) {
   console.log(`[Groq] Lens Loop enabled via LiteLLM: ${lensLoopGroqUrl}`);
 }
 
-// Initialize Groq client with direct LiteLLM for Langfuse observability
+// Initialize Groq client with direct LiteLLM for Lunary observability
 // Used when Lens Loop is unavailable - routes directly to LiteLLM → Groq
 let groqClientWithLiteLLM = null;
 if (LITELLM_URL && GROQ_API_KEY) {
@@ -328,7 +328,7 @@ if (LITELLM_URL && GROQ_API_KEY) {
     apiKey: 'not-needed', // LiteLLM uses its own API key
     baseURL: `${LITELLM_URL}/v1`
   });
-  console.log(`[Groq] LiteLLM direct enabled for Langfuse: ${LITELLM_URL}/v1`);
+  console.log(`[Groq] LiteLLM direct enabled for Lunary: ${LITELLM_URL}/v1`);
 }
 
 /**
@@ -656,10 +656,10 @@ async function callAnthropic(messages, options = {}) {
     }
   }
 
-  // Try direct LiteLLM for Langfuse observability (when Lens Loop unavailable)
+  // Try direct LiteLLM for Lunary observability (when Lens Loop unavailable)
   if (claudeClientWithLiteLLM) {
     try {
-      console.log(`[Anthropic] Using LiteLLM direct for Langfuse observability`);
+      console.log(`[Anthropic] Using LiteLLM direct for Lunary observability`);
 
       const openaiMessages = systemPrompt
         ? [{ role: 'system', content: systemPrompt }, ...chatMessages]
@@ -679,12 +679,12 @@ async function callAnthropic(messages, options = {}) {
       };
 
       const durationMs = Date.now() - startTime;
-      console.log(`[Anthropic] ✓ Response via LiteLLM/Langfuse (${content.length} chars) in ${durationMs}ms`);
+      console.log(`[Anthropic] ✓ Response via LiteLLM/Lunary (${content.length} chars) in ${durationMs}ms`);
 
       return {
         response: content.trim(),
         model: ANTHROPIC_MODEL,
-        backend: 'anthropic (langfuse)',
+        backend: 'anthropic (lunary)',
         usage
       };
     } catch (litellmError) {
@@ -765,10 +765,10 @@ async function callGroq(messages, options = {}) {
     }
   }
 
-  // Try direct LiteLLM for Langfuse observability (when Lens Loop unavailable)
+  // Try direct LiteLLM for Lunary observability (when Lens Loop unavailable)
   if (groqClientWithLiteLLM) {
     try {
-      console.log(`[Groq] Using LiteLLM direct for Langfuse observability`);
+      console.log(`[Groq] Using LiteLLM direct for Lunary observability`);
 
       const response = await groqClientWithLiteLLM.chat.completions.create({
         model: 'groq-llama', // LiteLLM model alias for Groq
@@ -781,12 +781,12 @@ async function callGroq(messages, options = {}) {
       const usage = response.usage || {};
       const durationMs = Date.now() - startTime;
 
-      console.log(`[Groq] ✓ Response via LiteLLM/Langfuse (${content.length} chars) in ${durationMs}ms`);
+      console.log(`[Groq] ✓ Response via LiteLLM/Lunary (${content.length} chars) in ${durationMs}ms`);
 
       return {
         response: content.trim(),
         model: GROQ_MODEL,
-        backend: 'groq (langfuse)',
+        backend: 'groq (lunary)',
         usage
       };
     } catch (litellmError) {
