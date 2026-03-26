@@ -2103,6 +2103,10 @@ async function checkEmbeddingHealth(backend) {
 
   // Return cached status if fresh
   if (cache && (now - cache.lastCheck) < HEALTH_CACHE_TTL) {
+    const ttlRemaining = Math.round((HEALTH_CACHE_TTL - (now - cache.lastCheck)) / 1000);
+    if (cache.status !== 'healthy') {
+      console.log(`[EmbedHealth] ${backend} cached as '${cache.status}' (expires in ${ttlRemaining}s)`);
+    }
     return cache.status === 'healthy';
   }
 
@@ -2120,8 +2124,12 @@ async function checkEmbeddingHealth(backend) {
 
     const healthy = response.ok;
     healthCache[cacheKey] = { status: healthy ? 'healthy' : 'unhealthy', lastCheck: now };
+    if (!healthy) {
+      console.warn(`[EmbedHealth] ${backend} health check returned ${response.status} at ${url}`);
+    }
     return healthy;
   } catch (error) {
+    console.warn(`[EmbedHealth] ${backend} health check failed: ${error.message} (${url})`);
     healthCache[cacheKey] = { status: 'unavailable', lastCheck: now };
     return false;
   }
@@ -2237,12 +2245,12 @@ async function getEmbeddings(texts, options = {}) {
 
         return { ...result, backend: 'Local GPU Triton (Tier 1)', model: EMBEDDING_MODEL };
       } catch (error) {
-        console.warn(`[Embedding] Local GPU failed: ${error.message}`);
+        console.warn(`[Embedding] Local GPU inference failed: ${error.message} — marking unavailable for ${HEALTH_CACHE_TTL / 1000}s`);
         fallbackCounter.inc({ from_tier: 'local-gpu-embed', to_tier: 'vps-cpu-embed', reason: 'error' });
         healthCache.embeddingPrimary = { status: 'unavailable', lastCheck: Date.now() };
       }
     } else {
-      console.log('[Embedding] Local GPU unavailable, skipping Tier 1');
+      console.log(`[Embedding] Local GPU unavailable (cached status: ${healthCache.embeddingPrimary?.status}), skipping Tier 1`);
       fallbackCounter.inc({ from_tier: 'local-gpu-embed', to_tier: 'vps-cpu-embed', reason: 'unhealthy' });
     }
   }
@@ -2263,7 +2271,7 @@ async function getEmbeddings(texts, options = {}) {
 
       return { ...result, backend: 'VPS CPU Triton (Tier 2)', model: EMBEDDING_MODEL };
     } catch (error) {
-      console.warn(`[Embedding] VPS CPU failed: ${error.message}`);
+      console.warn(`[Embedding] VPS CPU inference failed: ${error.message} — marking unavailable for ${HEALTH_CACHE_TTL / 1000}s`);
       healthCache.embeddingFallback = { status: 'unavailable', lastCheck: Date.now() };
     }
   }
