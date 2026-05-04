@@ -30,6 +30,15 @@ data:
         litellm_params:
           model: groq/llama-3.3-70b-versatile
           api_key: "os.environ/GROQ_API_KEY"
+      # Local Ollama (IPEX-LLM SYCL on debian-marmoset Iris Xe)
+      - model_name: local-llama
+        litellm_params:
+          model: ollama_chat/llama3.2:3b-instruct-q4_K_M
+          api_base: http://ollama.default.svc.cluster.local:11434
+      - model_name: ollama-llama3.2-3b
+        litellm_params:
+          model: ollama_chat/llama3.2:3b-instruct-q4_K_M
+          api_base: http://ollama.default.svc.cluster.local:11434
 
     litellm_settings:
       drop_params: true
@@ -69,9 +78,9 @@ spec:
           resources:
             requests:
               cpu: 50m
-              memory: 128Mi
-            limits:
               memory: 256Mi
+            limits:
+              memory: 512Mi
       containers:
         - name: litellm
           image: ghcr.io/berriai/litellm:main-latest
@@ -107,10 +116,13 @@ spec:
           resources:
             requests:
               cpu: 100m
-              memory: 256Mi
-            limits:
-              cpu: 500m
               memory: 512Mi
+            limits:
+              # 1Gi gives startup-time headroom — steady-state is ~770Mi.
+              # Pre-Ollama-addition the limit was 512Mi but the live pod was
+              # actually consuming ~770Mi (would OOM on any restart). The
+              # limit was effectively never enforced during steady-state.
+              memory: 1Gi
           volumeMounts:
             - name: config
               mountPath: /app/config.yaml
