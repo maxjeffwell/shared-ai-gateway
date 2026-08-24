@@ -123,11 +123,11 @@ spec:
             failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: /health
+              path: /livez   # NOT /health - it calls RunPod/local backends and times out under load
               port: 8002
             initialDelaySeconds: 10
             periodSeconds: 30
-            timeoutSeconds: 15
+            timeoutSeconds: 5
             failureThreshold: 3
 ---
 apiVersion: v1
