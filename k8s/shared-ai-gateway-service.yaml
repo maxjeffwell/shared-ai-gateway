@@ -1,0 +1,22 @@
+# Second Service for the gateway (shared-ai-gateway-service). Exported from the
+# live cluster 2026-09-26 (was hand-applied); empty kubectl diff.
+apiVersion: v1
+kind: Service
+metadata:
+  name: shared-ai-gateway-service
+  namespace: default
+  labels:
+    app: shared-ai-gateway
+    component: ai-gateway
+    portfolio: 'true'
+    tier: ai
+spec:
+  type: ClusterIP
+  selector:
+    app: shared-ai-gateway
+  ports:
+  - name: http
+    port: 8002
+    protocol: TCP
+    targetPort: 8002
+  sessionAffinity: None
