@@ -33,6 +33,14 @@ spec:
         - name: wait-for-kafka
           image: busybox:1.37
           command: ['sh', '-c', 'until nc -z vertex-kafka-kafka-bootstrap.microservices.svc 9092; do echo "Waiting for Kafka..."; sleep 5; done']
+          # default-quota rejects any container without requests + a memory
+          # limit -- including init containers.
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
       containers:
         - name: ai-gateway
           image: maxjeffwell/shared-ai-gateway:latest
@@ -74,7 +82,7 @@ spec:
             - name: LOCAL_GPU_MODEL
               value: "llama3.2:3b-instruct-q4_K_M"
             - name: LOCAL_URL
-              value: "http://llama-cpu-service:8080"
+              value: "http://ollama.default.svc.cluster.local:11434"
             - name: HF_MODEL
               value: "meta-llama/Llama-3.1-8B-Instruct"
             - name: RUNPOD_API_KEY
