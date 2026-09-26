@@ -68,9 +68,17 @@ spec:
         portfolio: "true"
         tier: ai
     spec:
+      # Edge node: upstreams are Anthropic/Groq over the internet; frees memory on the home etcd servers
+      nodeSelector:
+        role: edge
+      tolerations:
+        - key: role
+          operator: Equal
+          value: edge
+          effect: PreferNoSchedule
       initContainers:
         - name: install-lunary
-          image: ghcr.io/berriai/litellm:main-latest
+          image: python:3.13-slim
           command: ["pip", "install", "--target=/opt/lunary", "lunary"]
           volumeMounts:
             - name: lunary-pkg
@@ -83,7 +91,8 @@ spec:
               memory: 512Mi
       containers:
         - name: litellm
-          image: ghcr.io/berriai/litellm:main-latest
+          # Pinned: newer main-latest builds refuse to start without LITELLM_MASTER_KEY (UnsafeMasterKeyError)
+          image: ghcr.io/berriai/litellm@sha256:32c04b00bc1a720e6d5eeb56a7e72f4e1e7d1e538e779c59b990cbddfd5e27da
           args:
             - "--config"
             - "/app/config.yaml"
@@ -116,13 +125,10 @@ spec:
           resources:
             requests:
               cpu: 100m
-              memory: 512Mi
-            limits:
-              # 1Gi gives startup-time headroom — steady-state is ~770Mi.
-              # Pre-Ollama-addition the limit was 512Mi but the live pod was
-              # actually consuming ~770Mi (would OOM on any restart). The
-              # limit was effectively never enforced during steady-state.
               memory: 1Gi
+            limits:
+              # 2Gi gives startup-time headroom; steady-state is ~450–770Mi.
+              memory: 2Gi
           volumeMounts:
             - name: config
               mountPath: /app/config.yaml
@@ -133,14 +139,14 @@ spec:
             httpGet:
               path: /health/liveliness  # Don't use /health - it makes real API calls!
               port: 4000
-            initialDelaySeconds: 30
+            initialDelaySeconds: 120
             periodSeconds: 30
             timeoutSeconds: 10
           readinessProbe:
             httpGet:
               path: /health/readiness  # Don't use /health - it makes real API calls!
               port: 4000
-            initialDelaySeconds: 10
+            initialDelaySeconds: 30
             periodSeconds: 10
             timeoutSeconds: 5
       volumes:
