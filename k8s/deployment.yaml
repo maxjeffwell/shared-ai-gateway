@@ -71,12 +71,8 @@ spec:
               value: "true"
             - name: REDIS_URL
               value: "redis://:redis123@redis:6379"
-            - name: LENS_LOOP_PROXY
-              value: "https://lens-loop.el-jefe.me"
             - name: LITELLM_URL
               value: "https://litellm.el-jefe.me"
-            - name: LENS_LOOP_PROJECT
-              value: "lens-loop-project"
             - name: LOCAL_GPU_URL
               value: "https://gpu.el-jefe.me"
             - name: LOCAL_GPU_MODEL
