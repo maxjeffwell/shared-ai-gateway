@@ -190,12 +190,17 @@ const BACKEND_PREFERENCE = process.env.BACKEND_PREFERENCE || 'auto';
 // =============================================================================
 // EMBEDDING BACKEND CONFIGURATION - 2-Tier Fallback
 // =============================================================================
-// Tier 1: Local GPU Triton (GTX 1080 with bge_embeddings via Cloudflare tunnel)
-// Tier 2: VPS CPU Triton (always-available fallback)
+// Tier 1: EMBEDDING_PRIMARY_URL   (2026-09-30: OVMS on the Intel iGPU, e5-large)
+// Tier 2: EMBEDDING_FALLBACK_URL  (same protocol; defaults to the primary)
+// EMBEDDING_API selects the wire protocol of BOTH tiers:
+//   'openai' -> POST {url}/v3/embeddings {model, input}   (OpenVINO Model Server)
+//   'triton' -> POST {url}/v2/models/{model}/infer BYTES  (legacy Triton, retired)
+// Both servers answer GET {url}/v2/health/ready, which the health checks use.
 // =============================================================================
-const EMBEDDING_PRIMARY_URL = process.env.EMBEDDING_PRIMARY_URL; // e.g., https://embeddings.el-jefe.me
-const EMBEDDING_FALLBACK_URL = process.env.EMBEDDING_FALLBACK_URL || 'http://triton-embeddings:8000';
+const EMBEDDING_PRIMARY_URL = process.env.EMBEDDING_PRIMARY_URL; // e.g., http://ovms-embeddings.ovms:8000
+const EMBEDDING_FALLBACK_URL = process.env.EMBEDDING_FALLBACK_URL || EMBEDDING_PRIMARY_URL || 'http://triton-embeddings:8000';
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'bge_embeddings';
+const EMBEDDING_API = (process.env.EMBEDDING_API || 'triton').toLowerCase(); // 'openai' | 'triton'
 
 // =============================================================================
 // ANTHROPIC (CLAUDE) CONFIGURATION - Premium tier for complex reasoning
@@ -2136,6 +2141,41 @@ async function checkEmbeddingHealth(backend) {
 }
 
 /**
+ * Call an OpenAI-compatible embeddings endpoint (OpenVINO Model Server /v3/embeddings).
+ * Same return shape as callTritonEmbedding.
+ */
+async function callOpenAIEmbedding(url, texts) {
+  const inputTexts = Array.isArray(texts) ? texts : [texts];
+  console.log(`[Embedding] Calling OpenAI-compatible embeddings at ${url} (${EMBEDDING_MODEL}) with ${inputTexts.length} text(s)`);
+  const response = await fetch(`${url}/v3/embeddings`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: EMBEDDING_MODEL, input: inputTexts }),
+    signal: AbortSignal.timeout(30000)
+  });
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Embedding error ${response.status}: ${error}`);
+  }
+  const data = await response.json();
+  const items = Array.isArray(data.data) ? [...data.data].sort((a, b) => (a.index ?? 0) - (b.index ?? 0)) : [];
+  if (items.length !== inputTexts.length) {
+    throw new Error(`Embedding response had ${items.length} vectors for ${inputTexts.length} inputs`);
+  }
+  const vectors = items.map(i => i.embedding);
+  const dimensions = vectors[0]?.length || 0;
+  if (!Array.isArray(texts)) {
+    return { embedding: vectors[0], dimensions };
+  }
+  return { embeddings: vectors, dimensions };
+}
+
+/** Dispatch on EMBEDDING_API. */
+function callEmbeddingBackend(url, texts) {
+  return EMBEDDING_API === 'openai' ? callOpenAIEmbedding(url, texts) : callTritonEmbedding(url, texts);
+}
+
+/**
  * Call Triton embedding server (KServe V2 protocol)
  * Returns embeddings for input text(s)
  */
@@ -2215,7 +2255,7 @@ async function getEmbeddings(texts, options = {}) {
 
   // Force specific backend
   if (forceBackend === 'vps' || forceBackend === 'fallback') {
-    const result = await instrumentedCall('vps-cpu-embed', () => callTritonEmbedding(EMBEDDING_FALLBACK_URL, texts), 'embedding');
+    const result = await instrumentedCall('vps-cpu-embed', () => callEmbeddingBackend(EMBEDDING_FALLBACK_URL, texts), 'embedding');
     return { ...result, backend: 'VPS CPU Triton', model: EMBEDDING_MODEL };
   }
 
@@ -2223,7 +2263,7 @@ async function getEmbeddings(texts, options = {}) {
     if (!isEmbeddingPrimaryConfigured()) {
       throw new Error('Local GPU embedding backend not configured');
     }
-    const result = await instrumentedCall('local-gpu-embed', () => callTritonEmbedding(EMBEDDING_PRIMARY_URL, texts), 'embedding');
+    const result = await instrumentedCall('local-gpu-embed', () => callEmbeddingBackend(EMBEDDING_PRIMARY_URL, texts), 'embedding');
     return { ...result, backend: 'Local GPU Triton', model: EMBEDDING_MODEL };
   }
 
@@ -2235,7 +2275,7 @@ async function getEmbeddings(texts, options = {}) {
     if (localGpuHealthy) {
       try {
         console.log('[Embedding] Trying Local GPU Triton (Tier 1)...');
-        const result = await instrumentedCall('local-gpu-embed', () => callTritonEmbedding(EMBEDDING_PRIMARY_URL, texts), 'embedding');
+        const result = await instrumentedCall('local-gpu-embed', () => callEmbeddingBackend(EMBEDDING_PRIMARY_URL, texts), 'embedding');
 
         // Cache single text results
         if (!skipCache && inputTexts.length === 1) {
@@ -2261,7 +2301,7 @@ async function getEmbeddings(texts, options = {}) {
   if (vpsHealthy) {
     try {
       console.log('[Embedding] Falling back to VPS CPU Triton (Tier 2)...');
-      const result = await instrumentedCall('vps-cpu-embed', () => callTritonEmbedding(EMBEDDING_FALLBACK_URL, texts), 'embedding');
+      const result = await instrumentedCall('vps-cpu-embed', () => callEmbeddingBackend(EMBEDDING_FALLBACK_URL, texts), 'embedding');
 
       // Cache single text results
       if (!skipCache && inputTexts.length === 1) {
