@@ -201,6 +201,12 @@ const EMBEDDING_PRIMARY_URL = process.env.EMBEDDING_PRIMARY_URL; // e.g., http:/
 const EMBEDDING_FALLBACK_URL = process.env.EMBEDDING_FALLBACK_URL || EMBEDDING_PRIMARY_URL || 'http://triton-embeddings:8000';
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'bge_embeddings';
 const EMBEDDING_API = (process.env.EMBEDDING_API || 'triton').toLowerCase(); // 'openai' | 'triton'
+// Human-readable tier labels for /health, /api/backends, response.backend and logs.
+// Derived from the protocol so the labels follow the backend; override via env if needed.
+const EMBEDDING_PRIMARY_LABEL = process.env.EMBEDDING_PRIMARY_LABEL
+  || (EMBEDDING_API === 'openai' ? 'OVMS embeddings (Intel iGPU)' : 'Local GPU Triton');
+const EMBEDDING_FALLBACK_LABEL = process.env.EMBEDDING_FALLBACK_LABEL
+  || (EMBEDDING_API === 'openai' ? 'OVMS embeddings (fallback)' : 'VPS CPU Triton');
 
 // =============================================================================
 // ANTHROPIC (CLAUDE) CONFIGURATION - Premium tier for complex reasoning
@@ -1263,7 +1269,7 @@ app.get('/health', async (req, res) => {
   }
 
   // Add embedding backends to health check
-  // Tier 1: Local GPU Triton (fastest, primary), Tier 2: VPS CPU Triton (always-available fallback)
+  // Tier 1: EMBEDDING_PRIMARY_URL, Tier 2: EMBEDDING_FALLBACK_URL (labels follow EMBEDDING_API)
   health.embedding = {
     localGpu: {
       tier: 1,
@@ -1271,18 +1277,18 @@ app.get('/health', async (req, res) => {
       model: EMBEDDING_MODEL,
       url: EMBEDDING_PRIMARY_URL || 'not configured',
       status: 'checking...',
-      description: 'Local GPU Triton (primary)'
+      description: `${EMBEDDING_PRIMARY_LABEL} (primary)`
     },
     vpsCpu: {
       tier: 2,
       model: EMBEDDING_MODEL,
       url: EMBEDDING_FALLBACK_URL,
       status: 'checking...',
-      description: 'VPS CPU Triton (always-available fallback)'
+      description: `${EMBEDDING_FALLBACK_LABEL} (fallback)`
     }
   };
 
-  // Check Tier 1 embedding: Local GPU Triton
+  // Check Tier 1 embedding: primary
   if (isEmbeddingPrimaryConfigured()) {
     try {
       const response = await fetch(`${EMBEDDING_PRIMARY_URL}/v2/health/ready`, {
@@ -1292,13 +1298,13 @@ app.get('/health', async (req, res) => {
       health.embedding.localGpu.status = response.ok ? 'healthy' : 'unhealthy';
     } catch (error) {
       health.embedding.localGpu.status = 'offline';
-      health.embedding.localGpu.note = 'Local GPU/tunnel may be down';
+      health.embedding.localGpu.note = 'primary embedding backend unreachable';
     }
   } else {
     health.embedding.localGpu.status = 'not_configured';
   }
 
-  // Check Tier 2 embedding: VPS CPU Triton
+  // Check Tier 2 embedding: fallback
   try {
     const response = await fetch(`${EMBEDDING_FALLBACK_URL}/v2/health/ready`, {
       method: 'GET',
@@ -1310,13 +1316,13 @@ app.get('/health', async (req, res) => {
     health.embedding.vpsCpu.error = error.message;
   }
 
-  // Determine active embedding backend (Tier 1: Local GPU, Tier 2: VPS CPU)
+  // Determine active embedding backend (Tier 1: primary, Tier 2: fallback)
   if (health.embedding.localGpu.status === 'healthy') {
     health.activeEmbeddingBackend = 'localGpu';
-    health.activeEmbeddingDescription = 'Using Local GPU Triton (Tier 1)';
+    health.activeEmbeddingDescription = `Using ${EMBEDDING_PRIMARY_LABEL} (Tier 1)`;
   } else if (health.embedding.vpsCpu.status === 'healthy') {
     health.activeEmbeddingBackend = 'vpsCpu';
-    health.activeEmbeddingDescription = 'Using VPS CPU Triton (Tier 2 fallback)';
+    health.activeEmbeddingDescription = `Using ${EMBEDDING_FALLBACK_LABEL} (Tier 2 fallback)`;
   } else {
     health.activeEmbeddingBackend = 'none';
     health.activeEmbeddingDescription = 'No embedding backends available!';
@@ -2237,7 +2243,7 @@ async function callTritonEmbedding(url, texts) {
 
 /**
  * Unified embedding function - 2-tier fallback
- * Priority: Local GPU Triton (fastest) → VPS CPU Triton (always-available fallback)
+ * Priority: primary (EMBEDDING_PRIMARY_URL) → fallback (EMBEDDING_FALLBACK_URL)
  */
 async function getEmbeddings(texts, options = {}) {
   const { forceBackend, skipCache = false } = options;
@@ -2256,25 +2262,25 @@ async function getEmbeddings(texts, options = {}) {
   // Force specific backend
   if (forceBackend === 'vps' || forceBackend === 'fallback') {
     const result = await instrumentedCall('vps-cpu-embed', () => callEmbeddingBackend(EMBEDDING_FALLBACK_URL, texts), 'embedding');
-    return { ...result, backend: 'VPS CPU Triton', model: EMBEDDING_MODEL };
+    return { ...result, backend: EMBEDDING_FALLBACK_LABEL, model: EMBEDDING_MODEL };
   }
 
   if (forceBackend === 'local-gpu' || forceBackend === 'primary') {
     if (!isEmbeddingPrimaryConfigured()) {
-      throw new Error('Local GPU embedding backend not configured');
+      throw new Error('primary embedding backend not configured');
     }
     const result = await instrumentedCall('local-gpu-embed', () => callEmbeddingBackend(EMBEDDING_PRIMARY_URL, texts), 'embedding');
-    return { ...result, backend: 'Local GPU Triton', model: EMBEDDING_MODEL };
+    return { ...result, backend: EMBEDDING_PRIMARY_LABEL, model: EMBEDDING_MODEL };
   }
 
   // Auto mode: 2-tier fallback
-  // Tier 1: Local GPU Triton (fastest, primary)
+  // Tier 1: primary
   if (isEmbeddingPrimaryConfigured()) {
     const localGpuHealthy = await checkEmbeddingHealth('primary');
     backendGauge.set({ backend: 'local-gpu-embed' }, localGpuHealthy ? 1 : 0);
     if (localGpuHealthy) {
       try {
-        console.log('[Embedding] Trying Local GPU Triton (Tier 1)...');
+        console.log(`[Embedding] Trying ${EMBEDDING_PRIMARY_LABEL} (Tier 1)...`);
         const result = await instrumentedCall('local-gpu-embed', () => callEmbeddingBackend(EMBEDDING_PRIMARY_URL, texts), 'embedding');
 
         // Cache single text results
@@ -2283,24 +2289,24 @@ async function getEmbeddings(texts, options = {}) {
           await setInCache(cacheKey, result, 86400); // 24 hour cache for embeddings
         }
 
-        return { ...result, backend: 'Local GPU Triton (Tier 1)', model: EMBEDDING_MODEL };
+        return { ...result, backend: `${EMBEDDING_PRIMARY_LABEL} (Tier 1)`, model: EMBEDDING_MODEL };
       } catch (error) {
-        console.warn(`[Embedding] Local GPU inference failed: ${error.message} — marking unavailable for ${HEALTH_CACHE_TTL / 1000}s`);
+        console.warn(`[Embedding] primary inference failed: ${error.message} — marking unavailable for ${HEALTH_CACHE_TTL / 1000}s`);
         fallbackCounter.inc({ from_tier: 'local-gpu-embed', to_tier: 'vps-cpu-embed', reason: 'error' });
         healthCache.embeddingPrimary = { status: 'unavailable', lastCheck: Date.now() };
       }
     } else {
-      console.log(`[Embedding] Local GPU unavailable (cached status: ${healthCache.embeddingPrimary?.status}), skipping Tier 1`);
+      console.log(`[Embedding] primary unavailable (cached status: ${healthCache.embeddingPrimary?.status}), skipping Tier 1`);
       fallbackCounter.inc({ from_tier: 'local-gpu-embed', to_tier: 'vps-cpu-embed', reason: 'unhealthy' });
     }
   }
 
-  // Tier 2: VPS CPU Triton (always-available fallback)
+  // Tier 2: fallback
   const vpsHealthy = await checkEmbeddingHealth('fallback');
   backendGauge.set({ backend: 'vps-cpu-embed' }, vpsHealthy ? 1 : 0);
   if (vpsHealthy) {
     try {
-      console.log('[Embedding] Falling back to VPS CPU Triton (Tier 2)...');
+      console.log(`[Embedding] Falling back to ${EMBEDDING_FALLBACK_LABEL} (Tier 2)...`);
       const result = await instrumentedCall('vps-cpu-embed', () => callEmbeddingBackend(EMBEDDING_FALLBACK_URL, texts), 'embedding');
 
       // Cache single text results
@@ -2309,9 +2315,9 @@ async function getEmbeddings(texts, options = {}) {
         await setInCache(cacheKey, result, 86400);
       }
 
-      return { ...result, backend: 'VPS CPU Triton (Tier 2)', model: EMBEDDING_MODEL };
+      return { ...result, backend: `${EMBEDDING_FALLBACK_LABEL} (Tier 2)`, model: EMBEDDING_MODEL };
     } catch (error) {
-      console.warn(`[Embedding] VPS CPU inference failed: ${error.message} — marking unavailable for ${HEALTH_CACHE_TTL / 1000}s`);
+      console.warn(`[Embedding] fallback inference failed: ${error.message} — marking unavailable for ${HEALTH_CACHE_TTL / 1000}s`);
       healthCache.embeddingFallback = { status: 'unavailable', lastCheck: Date.now() };
     }
   }
@@ -2409,12 +2415,12 @@ app.get('/', (req, res) => {
         configured: isEmbeddingPrimaryConfigured(),
         model: EMBEDDING_MODEL,
         url: EMBEDDING_PRIMARY_URL || 'not configured',
-        description: 'Local GPU Triton (primary)'
+        description: `${EMBEDDING_PRIMARY_LABEL} (primary)`
       },
       'tier2_vpsCpu': {
         model: EMBEDDING_MODEL,
         url: EMBEDDING_FALLBACK_URL,
-        description: 'VPS CPU Triton (always-available fallback)'
+        description: `${EMBEDDING_FALLBACK_LABEL} (fallback)`
       }
     },
     endpoints: {
@@ -2647,11 +2653,11 @@ ${isRunPodConfigured() ? `║     Model: ${RUNPOD_MODEL.substring(0, 45).padEnd(
 ${isAnthropicConfigured() ? `║   Model: ${ANTHROPIC_MODEL.padEnd(47)}║\n` : ''}╠══════════════════════════════════════════════════════════╣
 ║   EMBEDDING BACKENDS (2-Tier Fallback)                   ║
 ╠══════════════════════════════════════════════════════════╣
-║   Tier 1: Local GPU Triton (Primary)                     ║
+║   Tier 1: ${(EMBEDDING_PRIMARY_LABEL + ' (Primary)').padEnd(47)}║
 ║     Configured: ${(isEmbeddingPrimaryConfigured() ? 'Yes' : 'No').padEnd(40)}║
 ${isEmbeddingPrimaryConfigured() ? `║     URL: ${EMBEDDING_PRIMARY_URL.substring(0, 47).padEnd(47)}║\n` : ''}║     Model: ${EMBEDDING_MODEL.padEnd(45)}║
 ╠══════════════════════════════════════════════════════════╣
-║   Tier 2: VPS CPU Triton (Always-Available Fallback)     ║
+║   Tier 2: ${(EMBEDDING_FALLBACK_LABEL + ' (Fallback)').padEnd(47)}║
 ║     URL: ${EMBEDDING_FALLBACK_URL.substring(0, 47).padEnd(47)}║
 ╚══════════════════════════════════════════════════════════╝
   `);
