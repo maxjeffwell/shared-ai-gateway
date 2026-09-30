@@ -83,8 +83,16 @@ spec:
               value: "llama3.2:3b-instruct-q4_K_M"
             - name: LOCAL_URL
               value: "http://ollama.default.svc.cluster.local:11434"
-            - name: HF_MODEL
-              value: "meta-llama/Llama-3.1-8B-Instruct"
+            # Embeddings: OpenVINO Model Server on the Intel iGPU (e5-large, 1024-d).
+            # Replaced the Triton/bge tiers 2026-09-30. Both tiers point at OVMS.
+            - name: EMBEDDING_API
+              value: "openai"
+            - name: EMBEDDING_PRIMARY_URL
+              value: "http://ovms-embeddings.ovms:8000"
+            - name: EMBEDDING_FALLBACK_URL
+              value: "http://ovms-embeddings.ovms:8000"
+            - name: EMBEDDING_MODEL
+              value: "e5-large"
             - name: RUNPOD_API_KEY
               valueFrom:
                 secretKeyRef:
