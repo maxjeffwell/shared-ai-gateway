@@ -167,6 +167,11 @@ const HUGGINGFACE_API_KEY = process.env.HUGGINGFACE_API_KEY;
 const HUGGINGFACE_MODEL = process.env.HF_MODEL || 'meta-llama/Llama-3.1-8B-Instruct';
 const HF_BASE_URL = 'https://router.huggingface.co/v1';
 
+// Tier 0: OVMS LLM on the Intel iGPU (2026-10-01). OpenAI-compatible /v3 API on the
+// same OVMS that serves e5-large embeddings. Free, in-cluster, ~1 s for tags.
+const OVMS_LLM_URL = process.env.OVMS_LLM_URL; // e.g. http://ovms-embeddings.ovms:8000/v3
+const OVMS_LLM_MODEL = process.env.OVMS_LLM_MODEL || 'qwen2.5-1.5b-instruct';
+
 // Lens Loop Observability - proxy for LLM tracing (optional)
 // When enabled, routes requests through Lens Loop for observability
 const LENS_LOOP_PROXY = process.env.LENS_LOOP_PROXY; // e.g., http://host.docker.internal:31300
@@ -257,6 +262,7 @@ if (GROQ_API_KEY) {
 // Health check cache (avoid hammering backends)
 const healthCache = {
   localGpu: { status: 'unknown', lastCheck: 0 },
+  ovmsLlm: { status: 'unknown', lastCheck: 0 },
   huggingface: { status: 'unknown', lastCheck: 0 },
   runpod: { status: 'unknown', lastCheck: 0 },
   local: { status: 'unknown', lastCheck: 0 },
@@ -273,6 +279,10 @@ const INFERENCE_URL = process.env.INFERENCE_URL || LOCAL_URL;
 /**
  * Check if HuggingFace Inference API is configured
  */
+function isOvmsLlmConfigured() {
+  return !!OVMS_LLM_URL;
+}
+
 function isHuggingFaceConfigured() {
   return !!HUGGINGFACE_API_KEY;
 }
@@ -399,6 +409,10 @@ async function checkBackendHealth(backend) {
         if (!isLocalGpuConfigured()) return false;
         url = LOCAL_GPU_URL;
         break;
+      case 'ovmsLlm':
+        if (!isOvmsLlmConfigured()) return false;
+        url = `${OVMS_LLM_URL}/models`;
+        break;
       case 'huggingface':
         if (!isHuggingFaceConfigured()) return false;
         url = `${HF_BASE_URL}/models`;
@@ -484,6 +498,41 @@ async function callLocalGpu(messages, options = {}) {
     model: LOCAL_GPU_MODEL,
     backend: 'local-gpu',
     usage: data.usage
+  };
+}
+
+/**
+ * Call the OVMS LLM (OpenVINO, Intel iGPU) - OpenAI-compatible chat completions
+ */
+async function callOvmsLlm(messages, options = {}) {
+  if (!isOvmsLlmConfigured()) {
+    throw new Error('OVMS LLM not configured');
+  }
+  const { maxTokens = 512, temperature = 0.7 } = options;
+
+  console.log(`[OVMS] Calling ${OVMS_LLM_MODEL} (Intel iGPU)`);
+
+  const response = await fetch(`${OVMS_LLM_URL}/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: OVMS_LLM_MODEL, messages, max_tokens: maxTokens, temperature }),
+    signal: AbortSignal.timeout(30000)
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`OVMS error ${response.status}: ${error.slice(0, 200)}`);
+  }
+
+  const data = await response.json();
+  const content = data.choices?.[0]?.message?.content || '';
+  console.log(`[OVMS] ✓ Response received (${content.length} chars)`);
+
+  return {
+    response: content.trim(),
+    model: OVMS_LLM_MODEL,
+    backend: 'ovms-llm',
+    usage: data.usage || { prompt_tokens: 0, completion_tokens: 0 }
   };
 }
 
@@ -748,7 +797,13 @@ async function callAnthropic(messages, options = {}) {
  * Routes through Lens Loop for observability when configured
  */
 async function callGroq(messages, options = {}) {
-  const { maxTokens = 2048, temperature = 0.7, lunaryMetadata } = options;
+  const { maxTokens: requestedMaxTokens = 2048, temperature = 0.7, lunaryMetadata } = options;
+  // gpt-oss models spend completion tokens on reasoning first: with the small
+  // budgets used for tags (50) they return an EMPTY answer (finish=length).
+  // Keep reasoning short and give them a floor of 512 tokens.
+  const isReasoningModel = /gpt-oss/.test(GROQ_MODEL);
+  const maxTokens = isReasoningModel ? Math.max(requestedMaxTokens, 512) : requestedMaxTokens;
+  const reasoningParams = isReasoningModel ? { reasoning_effort: process.env.GROQ_REASONING_EFFORT || 'low' } : {};
 
   if (!groqClient) {
     throw new Error('Groq client not initialized - missing GROQ_API_KEY');
@@ -767,6 +822,7 @@ async function callGroq(messages, options = {}) {
         messages,
         max_tokens: maxTokens,
         temperature,
+        ...reasoningParams,
         // Lunary metadata goes in the params: SDK v6 RequestOptions.body REPLACES the whole body (dropped messages -> LiteLLM 400)
         ...(lunaryMetadata && { metadata: lunaryMetadata })
       });
@@ -797,6 +853,7 @@ async function callGroq(messages, options = {}) {
         messages,
         max_tokens: maxTokens,
         temperature,
+        ...reasoningParams,
         // Lunary metadata goes in the params: SDK v6 RequestOptions.body REPLACES the whole body (dropped messages -> LiteLLM 400)
         ...(lunaryMetadata && { metadata: lunaryMetadata })
       });
@@ -825,7 +882,8 @@ async function callGroq(messages, options = {}) {
     model: GROQ_MODEL,
     messages,
     max_tokens: maxTokens,
-    temperature
+    temperature,
+    ...reasoningParams
   });
 
   const content = response.choices?.[0]?.message?.content || '';
@@ -888,6 +946,11 @@ async function instrumentedCall(backendName, callFn, endpoint = 'inference') {
   const end = requestDuration.startTimer({ backend: backendName, endpoint });
   try {
     const result = await callFn();
+    // An empty completion is a failure, not a success: let auto mode fall through
+    // to the next tier (2026-10-01: RunPod returned '' after 91 s, logged as ✓).
+    if (result && typeof result.response === 'string' && !result.response.trim()) {
+      throw new Error(`${backendName} returned an empty response`);
+    }
     requestCounter.inc({ backend: backendName, endpoint, status: 'success' });
     end();
     return result;
@@ -972,7 +1035,31 @@ async function inference(prompt, options = {}) {
     return instrumentedCall('local-gpu', () => callLocalGpu(messages, { maxTokens, temperature }));
   }
 
-  // Auto mode: smart 4-tier fallback with health checks
+  // Auto mode: smart tiered fallback with health checks
+  // Tier 0: OVMS LLM on the Intel iGPU (in-cluster, free)
+  if (isOvmsLlmConfigured()) {
+    const ovmsHealthy = await checkBackendHealth('ovmsLlm');
+    backendGauge.set({ backend: 'ovms-llm' }, ovmsHealthy ? 1 : 0);
+    if (ovmsHealthy) {
+      try {
+        console.log('[auto] Trying OVMS LLM (Tier 0)...');
+        const ovmsResult = await instrumentedCall('ovms-llm', () => callOvmsLlm(messages, { maxTokens, temperature }));
+        if (!skipCache && temperature <= 0.5) {
+          const cacheKey = getCacheKey(prompt, { systemPrompt, maxTokens, backend });
+          await setInCache(cacheKey, ovmsResult);
+        }
+        return ovmsResult;
+      } catch (error) {
+        console.warn(`[auto] OVMS LLM failed: ${error.message}`);
+        fallbackCounter.inc({ from_tier: 'ovms-llm', to_tier: 'local-gpu', reason: 'error' });
+        healthCache.ovmsLlm = { status: 'unavailable', lastCheck: Date.now() };
+      }
+    } else {
+      console.log('[auto] OVMS LLM unavailable, skipping Tier 0');
+      fallbackCounter.inc({ from_tier: 'ovms-llm', to_tier: 'local-gpu', reason: 'unhealthy' });
+    }
+  }
+
   // Tier 1: Local GPU (Ollama via Cloudflare tunnel - free, fastest)
   if (isLocalGpuConfigured()) {
     const gpuHealthy = await checkBackendHealth('localGpu');
@@ -1039,6 +1126,22 @@ async function inference(prompt, options = {}) {
     } else {
       console.log('[auto] HuggingFace unavailable, skipping Tier 3');
       fallbackCounter.inc({ from_tier: 'huggingface', to_tier: 'runpod', reason: 'unhealthy' });
+    }
+  }
+
+  // Tier 3b: Groq (fast hosted API, already used for chat) before paid RunPod
+  if (isGroqConfigured()) {
+    try {
+      console.log('[auto] Trying Groq (Tier 3b)...');
+      const groqResult = await instrumentedCall('groq', () => callGroq(messages, { maxTokens, temperature }));
+      if (!skipCache && temperature <= 0.5) {
+        const cacheKey = getCacheKey(prompt, { systemPrompt, maxTokens, backend });
+        await setInCache(cacheKey, groqResult);
+      }
+      return groqResult;
+    } catch (error) {
+      console.warn(`[auto] Groq failed: ${error.message}`);
+      fallbackCounter.inc({ from_tier: 'groq', to_tier: 'runpod', reason: 'error' });
     }
   }
 
@@ -1770,6 +1873,24 @@ async function chatInference(messages, options = {}) {
   }
 
   // Auto mode: smart 4-tier fallback with health checks
+  // Tier 0: OVMS LLM on the Intel iGPU (in-cluster, free)
+  if (isOvmsLlmConfigured()) {
+    const ovmsHealthy = await checkBackendHealth('ovmsLlm');
+    backendGauge.set({ backend: 'ovms-llm' }, ovmsHealthy ? 1 : 0);
+    if (ovmsHealthy) {
+      try {
+        console.log('[chat-auto] Trying OVMS LLM (Tier 0)...');
+        return await instrumentedCall('ovms-llm', () => callOvmsLlm(messages, { maxTokens, temperature }), 'chat');
+      } catch (error) {
+        console.warn(`[chat-auto] OVMS LLM failed: ${error.message}`);
+        fallbackCounter.inc({ from_tier: 'ovms-llm', to_tier: 'local-gpu', reason: 'error' });
+        healthCache.ovmsLlm = { status: 'unavailable', lastCheck: Date.now() };
+      }
+    } else {
+      fallbackCounter.inc({ from_tier: 'ovms-llm', to_tier: 'local-gpu', reason: 'unhealthy' });
+    }
+  }
+
   // Tier 1: Local GPU (Ollama via Cloudflare tunnel)
   if (isLocalGpuConfigured()) {
     const gpuHealthy = await checkBackendHealth('localGpu');
@@ -1818,6 +1939,17 @@ async function chatInference(messages, options = {}) {
       }
     } else {
       fallbackCounter.inc({ from_tier: 'huggingface', to_tier: 'runpod', reason: 'unhealthy' });
+    }
+  }
+
+  // Tier 3b: Groq before paid RunPod
+  if (isGroqConfigured()) {
+    try {
+      console.log('[chat-auto] Trying Groq (Tier 3b)...');
+      return await instrumentedCall('groq', () => callGroq(messages, { maxTokens, temperature, lunaryMetadata }), 'chat');
+    } catch (error) {
+      console.warn(`[chat-auto] Groq failed: ${error.message}`);
+      fallbackCounter.inc({ from_tier: 'groq', to_tier: 'runpod', reason: 'error' });
     }
   }
 
@@ -2529,8 +2661,13 @@ function parseTags(text, fallbackTitle) {
     // Try to find JSON array
     const jsonMatch = text.match(/\[([^\]]+)\]/);
     if (jsonMatch) {
-      const parsed = JSON.parse(jsonMatch[0]);
-      return parsed.slice(0, 5);
+      try {
+        const parsed = JSON.parse(jsonMatch[0]);
+        if (Array.isArray(parsed)) return parsed.map(t => String(t).trim().toLowerCase()).filter(Boolean).slice(0, 5);
+      } catch {
+        // Small models often emit [a, b, c] without quotes: split the inner list instead
+        text = jsonMatch[1];
+      }
     }
 
     // Try comma-separated
