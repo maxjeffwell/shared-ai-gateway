@@ -2659,7 +2659,12 @@ function parseTags(text, fallbackTitle) {
 
   try {
     // Try to find JSON array
-    const jsonMatch = text.match(/\[([^\]]+)\]/);
+    // Small models sometimes bracket each tag separately: [a],[b],[c] or [a]\n[b]
+    const bracketGroups = [...text.matchAll(/\[([^\]]+)\]/g)];
+    if (bracketGroups.length > 1) {
+      text = bracketGroups.map(g => g[1]).join(',');
+    }
+    const jsonMatch = bracketGroups.length === 1 ? text.match(/\[([^\]]+)\]/) : null;
     if (jsonMatch) {
       try {
         const parsed = JSON.parse(jsonMatch[0]);
