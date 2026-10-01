@@ -24,11 +24,11 @@ data:
       # Groq models (for code-talk, educationelly apps)
       - model_name: groq-llama
         litellm_params:
-          model: groq/llama-3.3-70b-versatile
+          model: groq/openai/gpt-oss-120b   # 2026-10-01: Groq retired llama-3.3-70b-versatile; alias kept for callers
           api_key: "os.environ/GROQ_API_KEY"
       - model_name: llama-3.3-70b-versatile
         litellm_params:
-          model: groq/llama-3.3-70b-versatile
+          model: groq/openai/gpt-oss-120b   # 2026-10-01: Groq retired llama-3.3-70b-versatile; alias kept for callers
           api_key: "os.environ/GROQ_API_KEY"
       # Local Ollama (IPEX-LLM SYCL on debian-marmoset Iris Xe)
       - model_name: local-llama

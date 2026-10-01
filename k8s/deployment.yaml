@@ -66,7 +66,7 @@ spec:
                   name: ai-gateway-credentials
                   key: GROQ_API_KEY
             - name: GROQ_MODEL
-              value: "llama-3.3-70b-versatile"
+              value: "openai/gpt-oss-120b"   # 2026-10-01: Groq retired llama-3.3-70b-versatile
             - name: ANTHROPIC_API_KEY
               valueFrom:
                 secretKeyRef:

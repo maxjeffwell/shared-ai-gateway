@@ -31,7 +31,7 @@ Node.js/Express API gateway (v3.5) providing LLM inference and embeddings to all
 | 1 | HuggingFace Inference | Mistral-7B-Instruct-v0.3 | Default primary |
 | 2 | VPS CPU (llama.cpp) | llama-3.2-3b-instruct | Always-available fallback |
 | 3 | RunPod Serverless | Llama-3.1-8B-Instruct | GPU when available |
-| — | Groq | llama-3.3-70b-versatile | Auto for code-talk, educationelly, bookmarks |
+| — | Groq | openai/gpt-oss-120b | Auto for code-talk, educationelly, bookmarks |
 | — | Anthropic Claude | claude-sonnet-4-20250514 | Explicit request or complex tasks |
 
 In `auto` mode, the gateway health-checks each tier and falls back down the chain. Groq is used automatically for specific apps. Claude can be requested explicitly via `backend: "anthropic"`.
@@ -112,7 +112,7 @@ ANTHROPIC_MODEL=claude-sonnet-4-20250514
 
 # Groq
 GROQ_API_KEY=
-GROQ_MODEL=llama-3.3-70b-versatile
+GROQ_MODEL=openai/gpt-oss-120b
 
 # Embeddings
 EMBEDDING_PRIMARY_URL=  # local GPU Triton (Tier 1, e.g. https://embeddings.el-jefe.me)
