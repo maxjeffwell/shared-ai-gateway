@@ -1,0 +1,14 @@
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: shared-ai-gateway
+  labels:
+    app: shared-ai-gateway
+    component: ai-gateway
+    portfolio: "true"
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: shared-ai-gateway

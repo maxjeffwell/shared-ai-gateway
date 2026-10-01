@@ -17,7 +17,14 @@ metadata:
     portfolio: "true"
     tier: ai
 spec:
-  replicas: 1
+  # 2026-10-01: 2 replicas + zero-downtime rollout (cache is in Redis, so
+  # instances are interchangeable). PDB in pdb.yaml keeps one up during drains.
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: shared-ai-gateway
