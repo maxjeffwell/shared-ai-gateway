@@ -238,7 +238,7 @@ let openaiClientForClaude = null;
 // OpenAI-compatible API
 // =============================================================================
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
 const GROQ_API_URL = 'https://api.groq.com/openai/v1';
 
 // Apps that should use Groq instead of other backends
@@ -648,14 +648,14 @@ async function callAnthropic(messages, options = {}) {
       const openaiMessages = systemPrompt
         ? [{ role: 'system', content: systemPrompt }, ...chatMessages]
         : chatMessages;
-
-      const requestOptions = lunaryMetadata ? { body: { metadata: lunaryMetadata } } : undefined;
       const response = await openaiClientForClaude.chat.completions.create({
         model: 'claude-sonnet', // LiteLLM model alias
         messages: openaiMessages,
         max_tokens: maxTokens,
-        temperature
-      }, requestOptions);
+        temperature,
+        // Lunary metadata goes in the params: SDK v6 RequestOptions.body REPLACES the whole body (dropped messages -> LiteLLM 400)
+        ...(lunaryMetadata && { metadata: lunaryMetadata })
+      });
 
       const content = response.choices[0]?.message?.content || '';
       const usage = {
@@ -685,14 +685,14 @@ async function callAnthropic(messages, options = {}) {
       const openaiMessages = systemPrompt
         ? [{ role: 'system', content: systemPrompt }, ...chatMessages]
         : chatMessages;
-
-      const litellmRequestOptions = lunaryMetadata ? { body: { metadata: lunaryMetadata } } : undefined;
       const response = await claudeClientWithLiteLLM.chat.completions.create({
         model: 'claude-sonnet', // LiteLLM model alias
         messages: openaiMessages,
         max_tokens: maxTokens,
-        temperature
-      }, litellmRequestOptions);
+        temperature,
+        // Lunary metadata goes in the params: SDK v6 RequestOptions.body REPLACES the whole body (dropped messages -> LiteLLM 400)
+        ...(lunaryMetadata && { metadata: lunaryMetadata })
+      });
 
       const content = response.choices[0]?.message?.content || '';
       const usage = {
@@ -762,14 +762,14 @@ async function callGroq(messages, options = {}) {
   if (groqClientWithLensLoop) {
     try {
       console.log(`[Groq] Using Lens Loop → LiteLLM for observability`);
-
-      const groqLensLoopOptions = lunaryMetadata ? { body: { metadata: lunaryMetadata } } : undefined;
       const response = await groqClientWithLensLoop.chat.completions.create({
         model: 'groq-llama', // LiteLLM model alias for Groq
         messages,
         max_tokens: maxTokens,
-        temperature
-      }, groqLensLoopOptions);
+        temperature,
+        // Lunary metadata goes in the params: SDK v6 RequestOptions.body REPLACES the whole body (dropped messages -> LiteLLM 400)
+        ...(lunaryMetadata && { metadata: lunaryMetadata })
+      });
 
       const content = response.choices?.[0]?.message?.content || '';
       const usage = response.usage || {};
@@ -792,14 +792,14 @@ async function callGroq(messages, options = {}) {
   if (groqClientWithLiteLLM) {
     try {
       console.log(`[Groq] Using LiteLLM direct for Lunary observability`);
-
-      const groqLitellmOptions = lunaryMetadata ? { body: { metadata: lunaryMetadata } } : undefined;
       const response = await groqClientWithLiteLLM.chat.completions.create({
         model: 'groq-llama', // LiteLLM model alias for Groq
         messages,
         max_tokens: maxTokens,
-        temperature
-      }, groqLitellmOptions);
+        temperature,
+        // Lunary metadata goes in the params: SDK v6 RequestOptions.body REPLACES the whole body (dropped messages -> LiteLLM 400)
+        ...(lunaryMetadata && { metadata: lunaryMetadata })
+      });
 
       const content = response.choices?.[0]?.message?.content || '';
       const usage = response.usage || {};
