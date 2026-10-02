@@ -30,15 +30,18 @@ data:
         litellm_params:
           model: groq/openai/gpt-oss-120b   # 2026-10-01: Groq retired llama-3.3-70b-versatile; alias kept for callers
           api_key: "os.environ/GROQ_API_KEY"
-      # Local Ollama (IPEX-LLM SYCL on debian-marmoset Iris Xe)
+      # Local model: OVMS qwen2.5-1.5b-instruct on the Intel iGPU (OpenAI API at /v3).
+      # 2026-10-02: ollama retired; both aliases kept for callers.
       - model_name: local-llama
         litellm_params:
-          model: ollama_chat/llama3.2:3b-instruct-q4_K_M
-          api_base: http://ollama.default.svc.cluster.local:11434
+          model: openai/qwen2.5-1.5b-instruct
+          api_base: http://ovms-embeddings.ovms.svc.cluster.local:8000/v3
+          api_key: "unused"
       - model_name: ollama-llama3.2-3b
         litellm_params:
-          model: ollama_chat/llama3.2:3b-instruct-q4_K_M
-          api_base: http://ollama.default.svc.cluster.local:11434
+          model: openai/qwen2.5-1.5b-instruct
+          api_base: http://ovms-embeddings.ovms.svc.cluster.local:8000/v3
+          api_key: "unused"
 
     litellm_settings:
       drop_params: true
