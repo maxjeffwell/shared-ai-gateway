@@ -150,19 +150,16 @@ const app = express();
 const PORT = process.env.PORT || 8002;
 
 // =============================================================================
-// LLM INFERENCE BACKEND CONFIGURATION - 4-Tier Fallback
+// LLM INFERENCE BACKEND CONFIGURATION - Tiered Fallback
 // =============================================================================
-// Tier 1: Local GPU - Ollama on GTX 1080 via Cloudflare tunnel (free, fastest)
-// Tier 2: VPS CPU - llama.cpp server (free, always available)
+// Tier 0: OVMS LLM - qwen2.5-1.5b-instruct on the Intel iGPU (free, in-cluster)
 // Tier 3: HuggingFace Router - OpenAI-compatible API (free)
+// Tier 3b: Groq Cloud (free tier)
 // Tier 4: RunPod GPU - RTX 4090 serverless (paid, last resort)
+// Tiers 1-2 (Ollama local GPU / VPS CPU llama) removed 2026-10-02.
 // =============================================================================
 
-// Tier 1: Local GPU - Ollama via Cloudflare tunnel (optional, like embedding primary)
-const LOCAL_GPU_URL = process.env.LOCAL_GPU_URL; // e.g., https://gpu.el-jefe.me
-const LOCAL_GPU_MODEL = process.env.LOCAL_GPU_MODEL || 'llama3.2:3b-instruct-q4_K_M';
-
-// Tier 2: HuggingFace Inference API (migrated to router.huggingface.co)
+// Tier 3: HuggingFace Inference API (migrated to router.huggingface.co)
 const HUGGINGFACE_API_KEY = process.env.HUGGINGFACE_API_KEY;
 const HUGGINGFACE_MODEL = process.env.HF_MODEL || 'meta-llama/Llama-3.1-8B-Instruct';
 const HF_BASE_URL = 'https://router.huggingface.co/v1';
@@ -177,11 +174,6 @@ const OVMS_LLM_MODEL = process.env.OVMS_LLM_MODEL || 'qwen2.5-1.5b-instruct';
 const LENS_LOOP_PROXY = process.env.LENS_LOOP_PROXY; // e.g., http://host.docker.internal:31300
 const LENS_LOOP_PROJECT = process.env.LENS_LOOP_PROJECT || 'lens-loop-project';
 
-// Tier 3: VPS CPU - Llama 3.2 3B via llama.cpp server (always available)
-// Tier 2 (VPS CPU llama/ollama) retired 2026-10-02: unset LOCAL_URL disables the tier.
-const LOCAL_URL = process.env.LOCAL_URL;
-const LOCAL_MODEL = 'llama-3.2-3b-instruct';
-
 // Tier 4: RunPod GPU - Llama 3.1 8B on RTX 4090 (cloud, serverless)
 const RUNPOD_API_KEY = process.env.RUNPOD_API_KEY;
 const RUNPOD_ENDPOINT_ID = process.env.RUNPOD_ENDPOINT_ID;
@@ -190,7 +182,7 @@ const RUNPOD_BASE_URL = RUNPOD_ENDPOINT_ID
   : null;
 const RUNPOD_MODEL = process.env.RUNPOD_MODEL || 'meta-llama/Llama-3.1-8B-Instruct';
 
-// Backend preference: 'auto' (smart fallback), 'huggingface', 'local', 'runpod'
+// Backend preference: 'auto' (smart fallback), 'huggingface', 'runpod'
 const BACKEND_PREFERENCE = process.env.BACKEND_PREFERENCE || 'auto';
 
 // =============================================================================
@@ -262,20 +254,15 @@ if (GROQ_API_KEY) {
 
 // Health check cache (avoid hammering backends)
 const healthCache = {
-  localGpu: { status: 'unknown', lastCheck: 0 },
   ovmsLlm: { status: 'unknown', lastCheck: 0 },
   huggingface: { status: 'unknown', lastCheck: 0 },
   runpod: { status: 'unknown', lastCheck: 0 },
-  local: { status: 'unknown', lastCheck: 0 },
   anthropic: { status: 'unknown', lastCheck: 0 },
   groq: { status: 'unknown', lastCheck: 0 },
   embeddingPrimary: { status: 'unknown', lastCheck: 0 },
   embeddingFallback: { status: 'unknown', lastCheck: 0 }
 };
 const HEALTH_CACHE_TTL = 30000; // 30 seconds
-
-// Legacy support
-const INFERENCE_URL = process.env.INFERENCE_URL || LOCAL_URL;
 
 /**
  * Check if HuggingFace Inference API is configured
@@ -286,20 +273,6 @@ function isOvmsLlmConfigured() {
 
 function isHuggingFaceConfigured() {
   return !!HUGGINGFACE_API_KEY;
-}
-
-/**
- * Check if Local GPU (Ollama) is configured
- */
-function isLocalGpuConfigured() {
-  return !!LOCAL_GPU_URL;
-}
-
-/**
- * Check if the VPS CPU tier (llama.cpp/ollama) is configured
- */
-function isLocalConfigured() {
-  return !!LOCAL_URL;
 }
 
 /**
@@ -413,10 +386,6 @@ async function checkBackendHealth(backend) {
     let url, timeout = 3000;
 
     switch (backend) {
-      case 'localGpu':
-        if (!isLocalGpuConfigured()) return false;
-        url = LOCAL_GPU_URL;
-        break;
       case 'ovmsLlm':
         if (!isOvmsLlmConfigured()) return false;
         url = `${OVMS_LLM_URL}/models`;
@@ -428,10 +397,6 @@ async function checkBackendHealth(backend) {
       case 'runpod':
         if (!isRunPodConfigured()) return false;
         url = `${RUNPOD_BASE_URL}/health`;
-        break;
-      case 'local':
-        if (!isLocalConfigured()) return false;
-        url = `${LOCAL_URL}/health`;
         break;
       case 'anthropic':
         // Anthropic doesn't have a health endpoint, just check if configured
@@ -464,50 +429,6 @@ async function checkBackendHealth(backend) {
     healthCache[backend] = { status: 'unavailable', lastCheck: now };
     return false;
   }
-}
-
-/**
- * Call Local GPU Ollama via Cloudflare tunnel
- * Uses OpenAI-compatible /v1/chat/completions endpoint
- * Tier 1: Fastest inference (GTX 1080 GPU)
- */
-async function callLocalGpu(messages, options = {}) {
-  if (!isLocalGpuConfigured()) {
-    throw new Error('Local GPU not configured');
-  }
-
-  const { maxTokens = 512, temperature = 0.7 } = options;
-
-  console.log(`[LocalGPU] Calling ${LOCAL_GPU_MODEL} via ${LOCAL_GPU_URL}`);
-
-  const response = await fetch(`${LOCAL_GPU_URL}/v1/chat/completions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: LOCAL_GPU_MODEL,
-      messages,
-      max_tokens: maxTokens,
-      temperature
-    }),
-    signal: AbortSignal.timeout(30000)
-  });
-
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Local GPU inference failed: ${response.status} - ${error}`);
-  }
-
-  const data = await response.json();
-  const content = data.choices?.[0]?.message?.content || '';
-
-  console.log(`[LocalGPU] ✓ Response received (${content.length} chars)`);
-
-  return {
-    response: content,
-    model: LOCAL_GPU_MODEL,
-    backend: 'local-gpu',
-    usage: data.usage
-  };
 }
 
 /**
@@ -910,49 +831,6 @@ async function callGroq(messages, options = {}) {
 }
 
 /**
- * Call local Llama 3.2 3B backend (llama.cpp server - OpenAI compatible)
- */
-async function callLocal(messages, options = {}) {
-  const { maxTokens = 512, temperature = 0.7 } = options;
-
-  if (!isLocalConfigured()) {
-    throw new Error('VPS CPU backend not configured');
-  }
-
-  console.log(`[Local] Calling ${LOCAL_MODEL} with ${messages.length} messages`);
-
-  const response = await fetch(`${LOCAL_URL}/v1/chat/completions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: LOCAL_MODEL,
-      messages,
-      max_tokens: maxTokens,
-      temperature
-    }),
-    signal: AbortSignal.timeout(120000) // 2 min timeout for CPU inference
-  });
-
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Local inference failed: ${response.status} - ${error}`);
-  }
-
-  const data = await response.json();
-
-  const content = data.choices?.[0]?.message?.content || '';
-
-  console.log(`[Local] ✓ Response received (${content.length} chars)`);
-
-  return {
-    response: content,
-    model: LOCAL_MODEL,
-    backend: 'local',
-    usage: data.usage
-  };
-}
-
-/**
  * Instrumented backend call wrapper - tracks metrics
  */
 async function instrumentedCall(backendName, callFn, endpoint = 'inference') {
@@ -975,8 +853,8 @@ async function instrumentedCall(backendName, callFn, endpoint = 'inference') {
 }
 
 /**
- * Unified inference function - 3-tier fallback system with Redis caching
- * Priority: Local GPU (free) → RunPod GPU (paid) → VPS CPU (slow but reliable)
+ * Unified inference function - tiered fallback with Redis caching
+ * Priority: OVMS LLM (free, in-cluster) → HuggingFace → Groq → RunPod GPU (paid)
  */
 async function inference(prompt, options = {}) {
   const { systemPrompt, maxTokens = 512, temperature = 0.7, forceBackend, skipCache = false } = options;
@@ -1037,17 +915,6 @@ async function inference(prompt, options = {}) {
     }
   }
 
-  if (backend === 'local') {
-    return instrumentedCall('vps-cpu', () => callLocal(messages, { maxTokens, temperature }));
-  }
-
-  if (backend === 'local-gpu') {
-    if (!isLocalGpuConfigured()) {
-      throw new Error('Local GPU requested but not configured');
-    }
-    return instrumentedCall('local-gpu', () => callLocalGpu(messages, { maxTokens, temperature }));
-  }
-
   // Auto mode: smart tiered fallback with health checks
   // Tier 0: OVMS LLM on the Intel iGPU (in-cluster, free)
   if (isOvmsLlmConfigured()) {
@@ -1064,58 +931,13 @@ async function inference(prompt, options = {}) {
         return ovmsResult;
       } catch (error) {
         console.warn(`[auto] OVMS LLM failed: ${error.message}`);
-        fallbackCounter.inc({ from_tier: 'ovms-llm', to_tier: 'local-gpu', reason: 'error' });
+        fallbackCounter.inc({ from_tier: 'ovms-llm', to_tier: 'huggingface', reason: 'error' });
         healthCache.ovmsLlm = { status: 'unavailable', lastCheck: Date.now() };
       }
     } else {
       console.log('[auto] OVMS LLM unavailable, skipping Tier 0');
-      fallbackCounter.inc({ from_tier: 'ovms-llm', to_tier: 'local-gpu', reason: 'unhealthy' });
+      fallbackCounter.inc({ from_tier: 'ovms-llm', to_tier: 'huggingface', reason: 'unhealthy' });
     }
-  }
-
-  // Tier 1: Local GPU (Ollama via Cloudflare tunnel - free, fastest)
-  if (isLocalGpuConfigured()) {
-    const gpuHealthy = await checkBackendHealth('localGpu');
-    backendGauge.set({ backend: 'local-gpu' }, gpuHealthy ? 1 : 0);
-    if (gpuHealthy) {
-      try {
-        console.log('[auto] Trying Local GPU (Tier 1)...');
-        const gpuResult = await instrumentedCall('local-gpu', () => callLocalGpu(messages, { maxTokens, temperature }));
-        if (!skipCache && temperature <= 0.5) {
-          const cacheKey = getCacheKey(prompt, { systemPrompt, maxTokens, backend });
-          await setInCache(cacheKey, gpuResult);
-        }
-        return gpuResult;
-      } catch (error) {
-        console.warn(`[auto] Local GPU failed: ${error.message}`);
-        fallbackCounter.inc({ from_tier: 'local-gpu', to_tier: 'vps-cpu', reason: 'error' });
-        healthCache.localGpu = { status: 'unavailable', lastCheck: Date.now() };
-      }
-    } else {
-      console.log('[auto] Local GPU unavailable, skipping Tier 1');
-      fallbackCounter.inc({ from_tier: 'local-gpu', to_tier: 'vps-cpu', reason: 'unhealthy' });
-    }
-  }
-
-  // Tier 2: VPS CPU (reliable fallback)
-  const localHealthy = await checkBackendHealth('local');
-  backendGauge.set({ backend: 'vps-cpu' }, localHealthy ? 1 : 0);
-  if (localHealthy) {
-    try {
-      console.log('[auto] Trying VPS CPU (Tier 2)...');
-      const localResult = await instrumentedCall('vps-cpu', () => callLocal(messages, { maxTokens, temperature }));
-      if (!skipCache && temperature <= 0.5) {
-        const cacheKey = getCacheKey(prompt, { systemPrompt, maxTokens, backend });
-        await setInCache(cacheKey, localResult);
-      }
-      return localResult;
-    } catch (error) {
-      console.warn(`[auto] VPS CPU failed: ${error.message}`);
-      fallbackCounter.inc({ from_tier: 'vps-cpu', to_tier: 'huggingface', reason: 'error' });
-    }
-  } else {
-    console.log('[auto] VPS CPU unavailable, skipping Tier 2');
-    fallbackCounter.inc({ from_tier: 'vps-cpu', to_tier: 'huggingface', reason: 'unhealthy' });
   }
 
   // Tier 3: HuggingFace (free cloud inference)
@@ -1274,24 +1096,6 @@ app.get('/health', async (req, res) => {
         status: isOvmsLlmConfigured() ? 'checking...' : 'not_configured',
         description: 'OVMS LLM on the Intel iGPU (in-cluster, free)'
       },
-      // Tier 1: Local GPU (Ollama via Cloudflare tunnel)
-      localGpu: {
-        tier: 1,
-        configured: isLocalGpuConfigured(),
-        model: isLocalGpuConfigured() ? LOCAL_GPU_MODEL : null,
-        url: LOCAL_GPU_URL || 'not configured',
-        status: isLocalGpuConfigured() ? 'checking...' : 'not_configured',
-        description: 'Local GPU Ollama via Cloudflare tunnel (fastest, free)'
-      },
-      // Tier 2: VPS CPU
-      local: {
-        tier: 2,
-        configured: isLocalConfigured(),
-        model: isLocalConfigured() ? LOCAL_MODEL : null,
-        url: LOCAL_URL || 'not configured',
-        status: isLocalConfigured() ? 'checking...' : 'not_configured',
-        description: 'Llama 3.2 3B on VPS CPU (always available)'
-      },
       // Tier 3: HuggingFace Inference API
       huggingface: {
         tier: 3,
@@ -1334,32 +1138,6 @@ app.get('/health', async (req, res) => {
     }
   }
 
-  // Check Tier 1: Local GPU (Ollama)
-  if (isLocalGpuConfigured()) {
-    try {
-      const response = await fetch(LOCAL_GPU_URL, {
-        method: 'GET',
-        signal: AbortSignal.timeout(5000)
-      });
-      health.backends.localGpu.status = response.ok ? 'healthy' : 'unhealthy';
-    } catch (error) {
-      health.backends.localGpu.status = 'offline';
-      health.backends.localGpu.note = 'Local GPU/tunnel may be down';
-    }
-  }
-
-  // Check Tier 2: VPS CPU health
-  if (isLocalConfigured()) {
-    try {
-      const response = await fetch(`${LOCAL_URL}/health`, {
-        method: 'GET',
-        signal: AbortSignal.timeout(5000)
-      });
-      health.backends.local.status = response.ok ? 'healthy' : 'unhealthy';
-    } catch (error) {
-      health.backends.local.status = 'unavailable';
-    }
-  }
 
   // Check Tier 3: HuggingFace health
   if (isHuggingFaceConfigured()) {
@@ -1479,11 +1257,9 @@ app.get('/health', async (req, res) => {
   };
 
   // Determine active backend - same order as auto routing in generate/chat:
-  // OVMS LLM (0) → Local GPU (1) → VPS CPU (2) → HuggingFace (3) → Groq (3b) → RunPod (4)
+  // OVMS LLM (0) → HuggingFace (3) → Groq (3b) → RunPod (4)
   const tierOrder = [
     ['ovmsLlm', 'Using OVMS LLM on the Intel iGPU (Tier 0, free)'],
-    ['localGpu', 'Using Local GPU Ollama (Tier 1, fastest)'],
-    ['local', 'Using VPS CPU (Tier 2, reliable)'],
     ['huggingface', 'Using HuggingFace Router (Tier 3, free cloud)'],
     ['groq', 'Using Groq Cloud (Tier 3b, free tier)'],
     ['runpod', 'Using RunPod RTX 4090 (Tier 4, paid)'],
@@ -1893,18 +1669,7 @@ async function chatInference(messages, options = {}) {
     }
   }
 
-  if (backend === 'local') {
-    return instrumentedCall('vps-cpu', () => callLocal(messages, { maxTokens, temperature }), 'chat');
-  }
-
-  if (backend === 'local-gpu') {
-    if (!isLocalGpuConfigured()) {
-      throw new Error('Local GPU requested but not configured');
-    }
-    return instrumentedCall('local-gpu', () => callLocalGpu(messages, { maxTokens, temperature }), 'chat');
-  }
-
-  // Auto mode: smart 4-tier fallback with health checks
+  // Auto mode: tiered fallback with health checks
   // Tier 0: OVMS LLM on the Intel iGPU (in-cluster, free)
   if (isOvmsLlmConfigured()) {
     const ovmsHealthy = await checkBackendHealth('ovmsLlm');
@@ -1915,45 +1680,12 @@ async function chatInference(messages, options = {}) {
         return await instrumentedCall('ovms-llm', () => callOvmsLlm(messages, { maxTokens, temperature }), 'chat');
       } catch (error) {
         console.warn(`[chat-auto] OVMS LLM failed: ${error.message}`);
-        fallbackCounter.inc({ from_tier: 'ovms-llm', to_tier: 'local-gpu', reason: 'error' });
+        fallbackCounter.inc({ from_tier: 'ovms-llm', to_tier: 'huggingface', reason: 'error' });
         healthCache.ovmsLlm = { status: 'unavailable', lastCheck: Date.now() };
       }
     } else {
-      fallbackCounter.inc({ from_tier: 'ovms-llm', to_tier: 'local-gpu', reason: 'unhealthy' });
+      fallbackCounter.inc({ from_tier: 'ovms-llm', to_tier: 'huggingface', reason: 'unhealthy' });
     }
-  }
-
-  // Tier 1: Local GPU (Ollama via Cloudflare tunnel)
-  if (isLocalGpuConfigured()) {
-    const gpuHealthy = await checkBackendHealth('localGpu');
-    backendGauge.set({ backend: 'local-gpu' }, gpuHealthy ? 1 : 0);
-    if (gpuHealthy) {
-      try {
-        console.log('[chat-auto] Trying Local GPU (Tier 1)...');
-        return await instrumentedCall('local-gpu', () => callLocalGpu(messages, { maxTokens, temperature }), 'chat');
-      } catch (error) {
-        console.warn(`[chat-auto] Local GPU failed: ${error.message}`);
-        fallbackCounter.inc({ from_tier: 'local-gpu', to_tier: 'vps-cpu', reason: 'error' });
-        healthCache.localGpu = { status: 'unavailable', lastCheck: Date.now() };
-      }
-    } else {
-      fallbackCounter.inc({ from_tier: 'local-gpu', to_tier: 'vps-cpu', reason: 'unhealthy' });
-    }
-  }
-
-  // Tier 2: VPS CPU (reliable fallback)
-  const localHealthy = await checkBackendHealth('local');
-  backendGauge.set({ backend: 'vps-cpu' }, localHealthy ? 1 : 0);
-  if (localHealthy) {
-    try {
-      console.log('[chat-auto] Trying VPS CPU (Tier 2)...');
-      return await instrumentedCall('vps-cpu', () => callLocal(messages, { maxTokens, temperature }), 'chat');
-    } catch (error) {
-      console.warn(`[chat-auto] VPS CPU failed: ${error.message}`);
-      fallbackCounter.inc({ from_tier: 'vps-cpu', to_tier: 'huggingface', reason: 'error' });
-    }
-  } else {
-    fallbackCounter.inc({ from_tier: 'vps-cpu', to_tier: 'huggingface', reason: 'unhealthy' });
   }
 
   // Tier 3: HuggingFace (free cloud)
@@ -2545,18 +2277,13 @@ app.get('/', (req, res) => {
   res.json({
     name: 'Shared AI Gateway',
     version: '4.0.0',
-    description: '4-Tier LLM + 2-Tier Embedding GPU Fallback System with Anthropic Claude + Redis Caching',
+    description: 'Tiered LLM + 2-Tier Embedding Fallback System with Anthropic Claude + Redis Caching',
     backends: {
-      'tier1_localGpu': {
-        configured: isLocalGpuConfigured(),
-        model: isLocalGpuConfigured() ? LOCAL_GPU_MODEL : null,
-        url: LOCAL_GPU_URL || 'not configured',
-        description: 'Local GPU Ollama via Cloudflare tunnel (fastest, free)'
-      },
-      'tier2_vpsCpu': {
-        configured: isLocalConfigured(),
-        model: LOCAL_MODEL,
-        description: 'Llama 3.2 3B on VPS CPU (always available)'
+      'tier0_ovmsLlm': {
+        configured: isOvmsLlmConfigured(),
+        model: isOvmsLlmConfigured() ? OVMS_LLM_MODEL : null,
+        url: OVMS_LLM_URL || 'not configured',
+        description: 'OVMS LLM on the Intel iGPU (in-cluster, free)'
       },
       'tier3_huggingface': {
         configured: isHuggingFaceConfigured(),
@@ -2601,8 +2328,8 @@ app.get('/', (req, res) => {
       'GET /metrics': 'Prometheus metrics endpoint'
     },
     usage: {
-      backend_param: 'Add "backend": "localGpu|local|huggingface|runpod|anthropic|auto" to force a specific backend',
-      auto_mode: 'Default "auto" tries backends in order: localGpu → local (VPS CPU) → huggingface → runpod',
+      backend_param: 'Add "backend": "huggingface|runpod|anthropic|auto" to force a specific backend',
+      auto_mode: 'Default "auto" tries backends in order: OVMS LLM → huggingface → groq → runpod',
       anthropic_mode: 'Use "backend": "anthropic" or "claude" for complex reasoning tasks (K8s analysis, debugging)'
     }
   });
@@ -2764,8 +2491,7 @@ function parseQuizQuestions(text) {
 async function warmupBackends() {
   const warmupPrompt = [{ role: 'user', content: 'Hi' }];
   const backends = [
-    { name: 'localGpu', fn: () => callLocalGpu(warmupPrompt, { maxTokens: 1 }) },
-    { name: 'local', fn: () => callLocal(warmupPrompt, { maxTokens: 1 }) },
+    { name: 'ovmsLlm', fn: () => callOvmsLlm(warmupPrompt, { maxTokens: 1 }) },
   ];
 
   console.log('[Warmup] Warming up LLM backends...');
@@ -2807,15 +2533,11 @@ app.listen(PORT, async () => {
 ╠══════════════════════════════════════════════════════════╣
 ║   Tracing: ${(isLensLoopConfigured() ? 'Enabled ✓' : 'Disabled').padEnd(45)}║
 ${isLensLoopConfigured() ? `║   Proxy: ${LENS_LOOP_PROXY.substring(0, 47).padEnd(47)}║\n║   Project: ${LENS_LOOP_PROJECT.padEnd(45)}║\n` : ''}╠══════════════════════════════════════════════════════════╣
-║   LLM BACKENDS (4-Tier Fallback)                         ║
+║   LLM BACKENDS (Tiered Fallback)                         ║
 ╠══════════════════════════════════════════════════════════╣
-║   Tier 1: Local GPU (Ollama via Cloudflare Tunnel)       ║
-║     Configured: ${(isLocalGpuConfigured() ? 'Yes' : 'No').padEnd(40)}║
-${isLocalGpuConfigured() ? `║     URL: ${LOCAL_GPU_URL.substring(0, 47).padEnd(47)}║\n║     Model: ${LOCAL_GPU_MODEL.substring(0, 45).padEnd(45)}║\n` : ''}╠══════════════════════════════════════════════════════════╣
-║   Tier 2: VPS CPU (Always Available)                     ║
-║     URL: ${(LOCAL_URL || 'not configured').padEnd(47)}║
-║     Model: ${LOCAL_MODEL.padEnd(45)}║
-╠══════════════════════════════════════════════════════════╣
+║   Tier 0: OVMS LLM (Intel iGPU, in-cluster)              ║
+║     Configured: ${(isOvmsLlmConfigured() ? 'Yes' : 'No').padEnd(40)}║
+${isOvmsLlmConfigured() ? `║     URL: ${OVMS_LLM_URL.substring(0, 47).padEnd(47)}║\n║     Model: ${OVMS_LLM_MODEL.substring(0, 45).padEnd(45)}║\n` : ''}╠══════════════════════════════════════════════════════════╣
 ║   Tier 3: HuggingFace Router API                         ║
 ║     Configured: ${(isHuggingFaceConfigured() ? 'Yes' : 'No').padEnd(40)}║
 ${isHuggingFaceConfigured() ? `║     Model: ${HUGGINGFACE_MODEL.substring(0, 45).padEnd(45)}║\n` : ''}╠══════════════════════════════════════════════════════════╣

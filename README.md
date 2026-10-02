@@ -17,10 +17,10 @@ Node.js/Express API gateway (v3.5) providing LLM inference and embeddings to all
                     │  (fallback)  │     │  Backends       │
                     └──────────────┘     └─────────────────┘
                     │                    │
-  Tier 1: HuggingFace Inference API     Tier 1: Local GPU Triton (bge_embeddings)
-  Tier 2: VPS CPU (llama.cpp)           Tier 2: VPS CPU Triton (fallback)
-  Tier 3: RunPod GPU Serverless
-  Groq:   Free tier (select apps)
+  Tier 0: OVMS LLM (Intel iGPU)         Tier 1: OVMS e5-large (Intel iGPU)
+  Tier 3: HuggingFace Inference API     Tier 2: OVMS (fallback URL)
+  Tier 3b: Groq (free tier)
+  Tier 4: RunPod GPU Serverless
   Claude: Premium (complex reasoning)
 ```
 
@@ -28,13 +28,15 @@ Node.js/Express API gateway (v3.5) providing LLM inference and embeddings to all
 
 | Tier | Backend | Model | When Used |
 |:-----|:--------|:------|:----------|
-| 1 | HuggingFace Inference | Mistral-7B-Instruct-v0.3 | Default primary |
-| 2 | VPS CPU (llama.cpp) | llama-3.2-3b-instruct | Always-available fallback |
-| 3 | RunPod Serverless | Llama-3.1-8B-Instruct | GPU when available |
-| — | Groq | openai/gpt-oss-120b | Auto for code-talk, educationelly, bookmarks |
+| 0 | OVMS LLM (Intel iGPU, in-cluster) | qwen2.5-1.5b-instruct | Default primary (free) |
+| 3 | HuggingFace Inference | Llama-3.1-8B-Instruct | If configured |
+| 3b | Groq | openai/gpt-oss-120b | Free cloud fallback; auto for code-talk, educationelly, bookmarks |
+| 4 | RunPod Serverless | Llama-3.1-8B-Instruct | Paid last resort |
 | — | Anthropic Claude | claude-sonnet-4-20250514 | Explicit request or complex tasks |
 
-In `auto` mode, the gateway health-checks each tier and falls back down the chain. Groq is used automatically for specific apps. Claude can be requested explicitly via `backend: "anthropic"`.
+In `auto` mode, the gateway health-checks each tier and falls back down the chain. Groq is used automatically for specific apps. Claude can be requested explicitly via `backend: "anthropic"`. The Ollama tiers (local GPU tunnel, VPS CPU llama.cpp) were removed 2026-10-02.
+
+`GET /health` reports `ok` while OVMS LLM is healthy, `degraded` when traffic is falling back to remote/paid tiers, and `critical` when no backend is up.
 
 ## API Endpoints
 
@@ -56,7 +58,7 @@ In `auto` mode, the gateway health-checks each tier and falls back down the chai
 |:---------|:--------|:-----------|
 | `POST /api/ai/embed` | Generate text embeddings | `texts` (array) |
 
-2-tier fallback: Local GPU Triton → VPS CPU Triton.
+2-tier fallback: `EMBEDDING_PRIMARY_URL` → `EMBEDDING_FALLBACK_URL` (both OVMS e5-large today).
 
 ### System
 
@@ -92,16 +94,17 @@ LLM requests are traced through **LiteLLM** → **Langfuse** for full request/re
 ```bash
 # Server
 PORT=8002
-BACKEND_PREFERENCE=auto  # auto | local | runpod | anthropic | groq
+BACKEND_PREFERENCE=auto  # auto | huggingface | runpod | anthropic
 
-# HuggingFace (Tier 1)
+# OVMS LLM (Tier 0)
+OVMS_LLM_URL=http://ovms-llm.ovms:8000/v3
+OVMS_LLM_MODEL=qwen2.5-1.5b-instruct
+
+# HuggingFace (Tier 3)
 HUGGINGFACE_API_KEY=
-HF_MODEL=mistralai/Mistral-7B-Instruct-v0.3
+HF_MODEL=meta-llama/Llama-3.1-8B-Instruct
 
-# VPS CPU - llama.cpp (Tier 2)
-LOCAL_URL=http://llama-3b-service:8080
-
-# RunPod GPU (Tier 3)
+# RunPod GPU (Tier 4)
 RUNPOD_API_KEY=
 RUNPOD_ENDPOINT_ID=
 RUNPOD_MODEL=meta-llama/Llama-3.1-8B-Instruct
