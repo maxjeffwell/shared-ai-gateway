@@ -35,12 +35,12 @@ data:
       - model_name: local-llama
         litellm_params:
           model: openai/qwen2.5-1.5b-instruct
-          api_base: http://ovms-embeddings.ovms.svc.cluster.local:8000/v3
+          api_base: http://ovms-llm.ovms.svc.cluster.local:8000/v3
           api_key: "unused"
       - model_name: ollama-llama3.2-3b
         litellm_params:
           model: openai/qwen2.5-1.5b-instruct
-          api_base: http://ovms-embeddings.ovms.svc.cluster.local:8000/v3
+          api_base: http://ovms-llm.ovms.svc.cluster.local:8000/v3
           api_key: "unused"
 
     litellm_settings:

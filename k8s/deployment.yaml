@@ -96,9 +96,9 @@ spec:
               value: "http://ovms-embeddings.ovms:8000"
             - name: EMBEDDING_MODEL
               value: "e5-large"
-            # Text generation Tier 0 (2026-10-01): same OVMS, LLM graph qwen2.5-1.5b-instruct.
+            # Text generation Tier 0: OVMS qwen2.5-1.5b-instruct. 2026-10-02: own pod ovms-llm on neonmarmoset Xe.
             - name: OVMS_LLM_URL
-              value: "http://ovms-embeddings.ovms:8000/v3"
+              value: "http://ovms-llm.ovms:8000/v3"
             - name: OVMS_LLM_MODEL
               value: "qwen2.5-1.5b-instruct"
             - name: RUNPOD_API_KEY
