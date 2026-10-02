@@ -50,7 +50,7 @@ spec:
               memory: 32Mi
       containers:
         - name: ai-gateway
-          image: maxjeffwell/shared-ai-gateway:73ebf9f6743586bae3d63a142be55fbdfd1487fb   # pinned: mirror.gcr.io (neon/dm) serves stale :latest
+          image: maxjeffwell/shared-ai-gateway:bcf4a39dab30f59a32b38fe8e25f33942d894590   # pinned: mirror.gcr.io (neon/dm) serves stale :latest
           ports:
             - containerPort: 8002
               name: http
@@ -80,12 +80,6 @@ spec:
               value: "redis://:redis123@redis:6379"
             - name: LITELLM_URL
               value: "https://litellm.el-jefe.me"
-            - name: LOCAL_GPU_URL
-              value: "https://gpu.el-jefe.me"
-            - name: LOCAL_GPU_MODEL
-              value: "llama3.2:3b-instruct-q4_K_M"
-            - name: LOCAL_URL
-              value: "http://ollama.default.svc.cluster.local:11434"
             # Embeddings: OpenVINO Model Server on the Intel iGPU (e5-large, 1024-d).
             # Replaced the Triton/bge tiers 2026-09-30. Both tiers point at OVMS.
             - name: EMBEDDING_API
