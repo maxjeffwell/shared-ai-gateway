@@ -50,7 +50,7 @@ spec:
               memory: 32Mi
       containers:
         - name: ai-gateway
-          image: maxjeffwell/shared-ai-gateway:bcf4a39dab30f59a32b38fe8e25f33942d894590   # pinned: mirror.gcr.io (neon/dm) serves stale :latest
+          image: maxjeffwell/shared-ai-gateway:4920f6e7860057567a8559eb875f9afe84766864   # pinned: mirror.gcr.io (neon/dm) serves stale :latest
           ports:
             - containerPort: 8002
               name: http
