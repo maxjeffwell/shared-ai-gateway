@@ -2,6 +2,8 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import fetch from 'node-fetch';
+import dns from 'node:dns/promises';
+import net from 'node:net';
 import { createHash } from 'crypto';
 import Redis from 'ioredis';
 import promClient from 'prom-client';
@@ -1354,6 +1356,160 @@ app.post('/api/ai/generate', async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Bookmark tagging helpers (2026-10-06)
+//
+// Before: the tag route handed title+URL (+ an often empty description) to
+// inference(), which in 'auto' mode always lands on Tier 0 -- the 1.5B
+// qwen2.5 int4 model on the iGPU. With a thin title that model guessed
+// ("k8studio" -> wordpress, theme, hosting) and the answer was then cached for
+// an hour here and forever in the bookmarks app. Groq (120B, allow-listed for
+// 'bookmarks') was never reached because the route did not pass the app name.
+//
+// Now (user decision: local model FIRST, Groq as the FALLBACK):
+//   1. enrich thin bookmarks with the page's <title> / meta description (https
+//      only, 4 s, 256 KB, private/cluster hosts refused, redirects re-checked);
+//   2. ask the iGPU model with a stricter prompt;
+//   3. if that fails or the tags are not grounded in the bookmark, escalate to
+//      Groq; 4. keyword extraction remains the last resort.
+// ---------------------------------------------------------------------------
+const TAG_SYSTEM_PROMPT = `You tag web bookmarks for a personal bookmark manager.
+Return 3-5 tags as a JSON array of lowercase strings.
+Rules:
+- a tag is one or two words joined by a hyphen, e.g. "kubernetes", "git-worktree"; never underscores or spaces
+- prefer, in this order: the product or project name, the technology or language, the topic, the content type (docs, tutorial, article, tool, video, reference)
+- use only the title, URL and description you are given; never invent what the page is about
+- do not output generic tags such as website, web, online, page, link, internet, software, technology
+Output only the JSON array.`;
+
+const TAG_STOPLIST = new Set([
+  'website', 'websites', 'web', 'site', 'online', 'page', 'pages', 'link', 'links', 'internet',
+  'software', 'technology', 'tech', 'computer', 'computers', 'general', 'misc', 'other',
+  'resource', 'resources', 'info', 'information', 'stuff', 'homepage', 'home', 'www', 'com', 'org', 'io'
+]);
+
+function normalizeTags(raw) {
+  const out = [];
+  for (let t of raw || []) {
+    t = String(t).toLowerCase().trim()
+      .replace(/[_\s]+/g, '-')
+      .replace(/[^a-z0-9.+#-]/g, '')
+      .replace(/-{2,}/g, '-')
+      .replace(/^-+|-+$/g, '');
+    if (t.length < 2 || t.length > 30 || TAG_STOPLIST.has(t)) continue;
+    if (!out.includes(t)) out.push(t);
+    if (out.length === 5) break;
+  }
+  return out;
+}
+
+function tagTokens(text) {
+  return new Set(((text || '').toLowerCase().match(/[a-z0-9]{3,}/g)) || []);
+}
+
+// A small model's answer counts as poor when fewer than two tags survive
+// normalization or none of them shares a token with the bookmark itself.
+function tagsLookPoor(tags, ctx) {
+  if (tags.length < 2) return true;
+  const ground = tagTokens([ctx.title, ctx.pageTitle, ctx.siteName, ctx.url, ctx.description].join(' '));
+  return !tags.some(t => t.split(/[-.]/).some(part => part.length >= 3 && ground.has(part)));
+}
+
+function isPrivateIp(ip) {
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split('.').map(Number);
+    return a === 10 || a === 127 || a === 0 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+  }
+  const v6 = ip.toLowerCase();
+  if (v6.startsWith('::ffff:')) return isPrivateIp(v6.slice(7));
+  return v6 === '::1' || v6 === '::' || v6.startsWith('fc') || v6.startsWith('fd') || v6.startsWith('fe80');
+}
+
+async function hostIsFetchable(hostname) {
+  const h = hostname.toLowerCase();
+  if (h === 'localhost' || /\.(local|svc|cluster\.local|home\.arpa|internal|lan)$/.test(h) || !h.includes('.')) return false;
+  if (net.isIP(h)) return !isPrivateIp(h);
+  try {
+    const addrs = await dns.lookup(h, { all: true });
+    return addrs.length > 0 && addrs.every(a => !isPrivateIp(a.address));
+  } catch {
+    return false;
+  }
+}
+
+function decodeEntities(s) {
+  return s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'").replace(/&nbsp;/g, ' ').replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
+}
+
+// Fetch <title> + meta description of a bookmark page. https only (the
+// gateway's egress policy allows 443 everywhere, nothing on 80), 4 s budget,
+// first 256 KB, redirects followed by hand so every hop is re-validated.
+async function fetchPageMetadata(rawUrl) {
+  let u;
+  try { u = new URL(rawUrl); } catch { return null; }
+  if (u.protocol === 'http:') u.protocol = 'https:';
+  if (u.protocol !== 'https:') return null;
+  const cacheKey = `pagemeta:v1:${u.href}`;
+  const cached = await getFromCache(cacheKey);
+  if (cached) return cached;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4000);
+  try {
+    let res = null;
+    for (let hop = 0; hop < 4; hop++) {
+      if (!(await hostIsFetchable(u.hostname))) return null;
+      res = await fetch(u.href, {
+        signal: controller.signal,
+        redirect: 'manual',
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; shared-ai-gateway/1.0; +https://el-jefe.me)', Accept: 'text/html' }
+      });
+      if (res.status >= 300 && res.status < 400 && res.headers.get('location')) {
+        u = new URL(res.headers.get('location'), u.href);
+        if (u.protocol !== 'https:') return null;
+        continue;
+      }
+      break;
+    }
+    if (!res || !res.ok || !(res.headers.get('content-type') || '').includes('text/html')) return null;
+
+    const chunks = [];
+    let received = 0;
+    for await (const chunk of res.body) {
+      chunks.push(chunk);
+      received += chunk.length;
+      if (received >= 262144) { res.body.destroy?.(); break; }
+    }
+    const html = Buffer.concat(chunks).toString('utf8');
+    const pick = (re) => { const m = html.match(re); return m ? decodeEntities(m[1]).replace(/\s+/g, ' ').trim() : ''; };
+    const meta = {
+      title: pick(/<title[^>]*>([^<]{1,300})<\/title>/i).slice(0, 200),
+      description: (pick(/<meta[^>]+(?:name|property)=["'](?:description|og:description|twitter:description)["'][^>]*content=["']([^"']{1,600})["']/i)
+        || pick(/<meta[^>]+content=["']([^"']{1,600})["'][^>]*(?:name|property)=["'](?:description|og:description|twitter:description)["']/i)).slice(0, 400),
+      siteName: pick(/<meta[^>]+property=["']og:site_name["'][^>]*content=["']([^"']{1,100})["']/i).slice(0, 100)
+    };
+    if (!meta.title && !meta.description) return null;
+    await setInCache(cacheKey, meta, 86400);
+    return meta;
+  } catch (err) {
+    console.log(`[bookmarks] page metadata unavailable for ${u.hostname}: ${err.message}`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function buildTagPrompt(ctx) {
+  const lines = [`Title: ${ctx.title}`];
+  if (ctx.pageTitle && ctx.pageTitle.toLowerCase() !== ctx.title.toLowerCase()) lines.push(`Page title: ${ctx.pageTitle}`);
+  lines.push(`URL: ${ctx.url}`);
+  if (ctx.siteName) lines.push(`Site: ${ctx.siteName}`);
+  if (ctx.description) lines.push(`Description: ${ctx.description}`);
+  return `Bookmark:\n${lines.join('\n')}\n\nJSON array of 3-5 tags:`;
+}
+
 /**
  * POST /api/ai/tags
  * Generate tags for bookmarks (hybrid approach: keyword extraction + optional AI)
@@ -1394,24 +1550,84 @@ app.post('/api/ai/tags', async (req, res) => {
     console.log(`[bookmarks] Using AI to generate tags for: ${title.substring(0, 50)}...`);
 
     try {
-      const result = await inference(
-        `Generate 3-5 relevant tags for this bookmark:\nTitle: ${title}\nURL: ${url}\n${description ? `Description: ${description}` : ''}\n\nOutput only comma-separated lowercase tags, nothing else.`,
-        { systemPrompt: SYSTEM_PROMPTS.bookmarks, maxTokens: 50, temperature: 0.3 }
-      );
+      // Thin bookmarks (no/short description) get the page's own title and
+      // meta description so the model has something real to work from.
+      const ctx = { title, url, description: description || '' };
+      let enriched = false;
+      if (ctx.description.length < 40) {
+        const meta = await fetchPageMetadata(url);
+        if (meta) {
+          enriched = true;
+          ctx.pageTitle = meta.title;
+          ctx.siteName = meta.siteName;
+          ctx.description = [ctx.description, meta.description].filter(Boolean).join(' ');
+        }
+      }
+      const prompt = buildTagPrompt(ctx);
+      const messages = [{ role: 'system', content: TAG_SYSTEM_PROMPT }, { role: 'user', content: prompt }];
+      const llmOpts = { maxTokens: 60, temperature: 0.2 };
 
-      const tags = parseTags(result.response, title);
-      console.log(`[bookmarks] ✓ AI generated ${tags.length} tags via ${result.backend}:`, tags);
+      const cacheKey = getCacheKey(prompt, { task: 'tags', v: 2 });
+      const cached = await getFromCache(cacheKey);
+      if (cached) {
+        console.log(`[bookmarks] ✓ cached tags (${cached.backend}):`, cached.tags);
+        return res.json({ ...cached, title, url, fromCache: true });
+      }
+
+      let result = null;
+      let tags = [];
+      let escalateReason = null;
+
+      // 1) Local iGPU model first.
+      if (isOvmsLlmConfigured() && await checkBackendHealth('ovmsLlm')) {
+        try {
+          result = await instrumentedCall('ovms-llm', () => callOvmsLlm(messages, llmOpts));
+          tags = normalizeTags(parseTags(result.response, title));
+          if (tagsLookPoor(tags, ctx)) {
+            escalateReason = 'poor-tags';
+            console.log(`[bookmarks] OVMS tags not grounded in the bookmark, escalating:`, tags);
+          }
+        } catch (ovmsError) {
+          escalateReason = 'error';
+          console.log(`[bookmarks] OVMS tag generation failed: ${ovmsError.message}`);
+        }
+      } else {
+        escalateReason = 'unavailable';
+      }
+
+      // 2) Groq is the fallback (user decision 2026-10-06), never the first choice.
+      if (escalateReason && isGroqConfigured()) {
+        fallbackCounter.inc({ from_tier: 'ovms-llm', to_tier: 'groq', reason: escalateReason });
+        try {
+          const groqResult = await instrumentedCall('groq', () => callGroq(messages, llmOpts));
+          const groqTags = normalizeTags(parseTags(groqResult.response, title));
+          if (groqTags.length >= 2) {
+            result = groqResult;
+            tags = groqTags;
+          }
+        } catch (groqError) {
+          console.log(`[bookmarks] Groq fallback failed: ${groqError.message}`);
+        }
+      }
+
+      if (!result || tags.length < 2) {
+        throw new Error(`no usable AI tags (${escalateReason || 'empty'})`);
+      }
+
+      console.log(`[bookmarks] ✓ AI generated ${tags.length} tags via ${result.backend}${escalateReason ? ` (fallback: ${escalateReason})` : ''}:`, tags);
       emitAIEvent('tags', 'bookmarks', result, startTime);
 
-      return res.json({
+      const payload = {
         success: true,
         tags,
-        title,
-        url,
         method: 'ai-generation',
         backend: result.backend,
-        model: result.model
-      });
+        model: result.model,
+        enriched,
+        fallback: escalateReason || undefined
+      };
+      await setInCache(cacheKey, payload);
+      return res.json({ ...payload, title, url });
     } catch (aiError) {
       // Fallback to keyword extraction on AI failure
       const tags = extractKeywordTags(title, url, description);
