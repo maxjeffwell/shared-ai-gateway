@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import fetch from 'node-fetch';
 import dns from 'node:dns/promises';
 import net from 'node:net';
+import https from 'node:https';
 import { createHash } from 'crypto';
 import Redis from 'ioredis';
 import promClient from 'prom-client';
@@ -1415,27 +1416,70 @@ function tagsLookPoor(tags, ctx) {
   return !tags.some(t => t.split(/[-.]/).some(part => part.length >= 3 && ground.has(part)));
 }
 
+// Anything that is not plain public unicast: RFC1918, loopback, link-local,
+// CGNAT, multicast, reserved/benchmark/documentation ranges, and their IPv6
+// counterparts (incl. v4-mapped and NAT64 forms).
 function isPrivateIp(ip) {
   if (net.isIPv4(ip)) {
-    const [a, b] = ip.split('.').map(Number);
-    return a === 10 || a === 127 || a === 0 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31)
-      || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+    const [a, b, c] = ip.split('.').map(Number);
+    return a === 0 || a === 10 || a === 127 || a >= 224
+      || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
+      || (a === 100 && b >= 64 && b <= 127) || (a === 192 && b === 0 && (c === 0 || c === 2))
+      || (a === 198 && (b === 18 || b === 19)) || (a === 198 && b === 51 && c === 100) || (a === 203 && b === 0 && c === 113);
   }
   const v6 = ip.toLowerCase();
   if (v6.startsWith('::ffff:')) return isPrivateIp(v6.slice(7));
-  return v6 === '::1' || v6 === '::' || v6.startsWith('fc') || v6.startsWith('fd') || v6.startsWith('fe80');
+  if (v6.startsWith('64:ff9b:')) return true;
+  return v6 === '::1' || v6 === '::' || v6.startsWith('fc') || v6.startsWith('fd')
+    || v6.startsWith('fe8') || v6.startsWith('fe9') || v6.startsWith('fea') || v6.startsWith('feb')
+    || v6.startsWith('fec') || v6.startsWith('fed') || v6.startsWith('fee') || v6.startsWith('fef') || v6.startsWith('ff');
 }
 
-async function hostIsFetchable(hostname) {
+// Resolve once, validate every address, and return the one address the fetch
+// MUST connect to -- the socket is pinned to it (see pinnedAgent), so a DNS
+// answer that changes between check and connect (rebinding) cannot redirect
+// the request to an internal host.
+async function resolveFetchable(hostname) {
   const h = hostname.toLowerCase();
-  if (h === 'localhost' || /\.(local|svc|cluster\.local|home\.arpa|internal|lan)$/.test(h) || !h.includes('.')) return false;
-  if (net.isIP(h)) return !isPrivateIp(h);
+  if (h === 'localhost' || /\.(local|svc|cluster\.local|home\.arpa|internal|lan)$/.test(h) || !h.includes('.')) return null;
+  if (net.isIP(h)) return isPrivateIp(h) ? null : { address: h, family: net.isIPv6(h) ? 6 : 4 };
   try {
     const addrs = await dns.lookup(h, { all: true });
-    return addrs.length > 0 && addrs.every(a => !isPrivateIp(a.address));
+    if (addrs.length === 0 || addrs.some(a => isPrivateIp(a.address))) return null;
+    return addrs[0];
   } catch {
-    return false;
+    return null;
   }
+}
+
+function pinnedAgent(target) {
+  return new https.Agent({
+    keepAlive: false,
+    lookup: (_host, opts, cb) => (opts && opts.all
+      ? cb(null, [{ address: target.address, family: target.family }])
+      : cb(null, target.address, target.family))
+  });
+}
+
+// Per-tag parsing with bounded character classes only (no nested quantifiers),
+// so hostile HTML cannot make the extraction backtrack.
+function extractPageMeta(html) {
+  const clean = (s) => decodeEntities(s).replace(/\s+/g, ' ').trim();
+  const meta = { title: '', description: '', siteName: '' };
+  const t = html.match(/<title[^>]{0,200}>([^<]{1,300})<\/title>/i);
+  if (t) meta.title = clean(t[1]).slice(0, 200);
+  const tagRe = /<meta\s[^>]{0,1000}>/gi;
+  let m;
+  while ((m = tagRe.exec(html)) !== null && !(meta.description && meta.siteName)) {
+    const tag = m[0];
+    const key = (tag.match(/\b(?:name|property)\s{0,5}=\s{0,5}["']([^"']{1,60})["']/i) || [])[1];
+    const content = (tag.match(/\bcontent\s{0,5}=\s{0,5}["']([^"']{0,600})["']/i) || [])[1];
+    if (!key || !content) continue;
+    const k = key.toLowerCase();
+    if (!meta.description && (k === 'description' || k === 'og:description' || k === 'twitter:description')) meta.description = clean(content).slice(0, 400);
+    if (!meta.siteName && k === 'og:site_name') meta.siteName = clean(content).slice(0, 100);
+  }
+  return meta;
 }
 
 function decodeEntities(s) {
@@ -1460,10 +1504,12 @@ async function fetchPageMetadata(rawUrl) {
   try {
     let res = null;
     for (let hop = 0; hop < 4; hop++) {
-      if (!(await hostIsFetchable(u.hostname))) return null;
+      const target = await resolveFetchable(u.hostname);
+      if (!target) return null;
       res = await fetch(u.href, {
         signal: controller.signal,
         redirect: 'manual',
+        agent: pinnedAgent(target),
         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; shared-ai-gateway/1.0; +https://el-jefe.me)', Accept: 'text/html' }
       });
       if (res.status >= 300 && res.status < 400 && res.headers.get('location')) {
@@ -1482,14 +1528,7 @@ async function fetchPageMetadata(rawUrl) {
       received += chunk.length;
       if (received >= 262144) { res.body.destroy?.(); break; }
     }
-    const html = Buffer.concat(chunks).toString('utf8');
-    const pick = (re) => { const m = html.match(re); return m ? decodeEntities(m[1]).replace(/\s+/g, ' ').trim() : ''; };
-    const meta = {
-      title: pick(/<title[^>]*>([^<]{1,300})<\/title>/i).slice(0, 200),
-      description: (pick(/<meta[^>]+(?:name|property)=["'](?:description|og:description|twitter:description)["'][^>]*content=["']([^"']{1,600})["']/i)
-        || pick(/<meta[^>]+content=["']([^"']{1,600})["'][^>]*(?:name|property)=["'](?:description|og:description|twitter:description)["']/i)).slice(0, 400),
-      siteName: pick(/<meta[^>]+property=["']og:site_name["'][^>]*content=["']([^"']{1,100})["']/i).slice(0, 100)
-    };
+    const meta = extractPageMeta(Buffer.concat(chunks).toString('utf8'));
     if (!meta.title && !meta.description) return null;
     await setInCache(cacheKey, meta, 86400);
     return meta;
