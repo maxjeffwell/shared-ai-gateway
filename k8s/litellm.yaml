@@ -66,14 +66,12 @@ spec:
         portfolio: "true"
         tier: ai
     spec:
-      # Edge node: upstreams are Anthropic/Groq over the internet; frees memory on the home etcd servers
-      nodeSelector:
-        role: edge
-      tolerations:
-        - key: role
-          operator: Equal
-          value: edge
-          effect: PreferNoSchedule
+      # Not pinned to the edge any more (2026-10-07). It was put on role=edge
+      # on 9/25 because its upstreams were Anthropic/Groq over the internet,
+      # but it now also routes to OVMS (ovms-llm, home) and logs every call to
+      # lunary-backend (home): per-request home traffic, which the edge rule
+      # excludes (edge = only things that serve files). The scheduler places
+      # it; the VPS role=edge PreferNoSchedule taint keeps it at home.
       initContainers:
         - name: install-lunary
           image: python:3.13-slim
