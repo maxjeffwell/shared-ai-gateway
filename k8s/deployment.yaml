@@ -36,6 +36,15 @@ spec:
         portfolio: "true"
         tier: ai
     spec:
+      # 2026-10-07: soft spread of the 2 replicas across nodes (ScheduleAnyway:
+      # prefers different hostnames, never blocks scheduling, pins nothing).
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: shared-ai-gateway
       initContainers:
         - name: wait-for-kafka
           image: busybox:1.37
