@@ -2525,6 +2525,79 @@ app.post('/api/ai/embed', async (req, res) => {
 });
 
 /**
+ * POST /api/ai/rerank
+ * Cross-encoder reranking on OpenVINO Model Server (/v3/rerank, Cohere-style),
+ * model Qwen3-Reranker-0.6B (seq-cls fp16) on the neonmarmoset Iris Xe.
+ * Callers send plain text; Qwen3's query/document templates are applied here.
+ *
+ * Request:  { "query": "...", "documents": ["...", ...], "top_n"?: n, "instruction"?: "..." }
+ * Response: { success, results: [{ index, score }] (best first), model, latencyMs }
+ */
+const RERANK_URL = process.env.RERANK_URL || EMBEDDING_PRIMARY_URL;
+const RERANK_MODEL = process.env.RERANK_MODEL || 'qwen3-reranker-0.6b';
+const RERANK_MAX_DOCS = 100;          // OVMS default limit
+const RERANK_MAX_CHARS = 2000;        // per query/document; plenty for title + description
+const RERANK_DEFAULT_INSTRUCTION = 'Given a web search query, retrieve relevant passages that answer the query';
+const QWEN3_RERANK_PREFIX = '<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>\n<|im_start|>user\n';
+const QWEN3_RERANK_SUFFIX = '<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n';
+
+function clampText(t) {
+  return String(t).slice(0, RERANK_MAX_CHARS);
+}
+
+app.post('/api/ai/rerank', async (req, res) => {
+  const startTime = Date.now();
+  try {
+    const { query, documents, top_n: topN, instruction } = req.body || {};
+    if (typeof query !== 'string' || !query.trim()) {
+      return res.status(400).json({ error: 'query (non-empty string) is required' });
+    }
+    if (!Array.isArray(documents) || documents.length === 0) {
+      return res.status(400).json({ error: 'documents (non-empty array) is required' });
+    }
+    if (documents.length > RERANK_MAX_DOCS) {
+      return res.status(400).json({ error: `at most ${RERANK_MAX_DOCS} documents per request` });
+    }
+    if (!RERANK_URL) {
+      return res.status(503).json({ error: 'Reranker not configured (RERANK_URL / EMBEDDING_PRIMARY_URL)' });
+    }
+
+    const instr = typeof instruction === 'string' && instruction.trim()
+      ? clampText(instruction.trim())
+      : RERANK_DEFAULT_INSTRUCTION;
+    const body = {
+      model: RERANK_MODEL,
+      query: `${QWEN3_RERANK_PREFIX}<Instruct>: ${instr}\n<Query>: ${clampText(query)}\n`,
+      documents: documents.map(d => `<Document>: ${clampText(d ?? '')}${QWEN3_RERANK_SUFFIX}`),
+    };
+    if (Number.isInteger(topN) && topN > 0) body.top_n = Math.min(topN, documents.length);
+
+    const response = await fetch(`${RERANK_URL}/v3/rerank`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!response.ok) {
+      throw new Error(`Rerank error ${response.status}: ${(await response.text()).slice(0, 300)}`);
+    }
+    const data = await response.json();
+    const results = (data.results || [])
+      .map(r => ({ index: r.index, score: r.relevance_score }))
+      .sort((a, b) => b.score - a.score);
+
+    const result = { model: RERANK_MODEL, backend: 'ovms', count: results.length };
+    emitAIEvent('rerank', 'general', result, startTime);
+    console.log(`[rerank] ✓ ${documents.length} docs in ${Date.now() - startTime}ms`);
+    res.json({ success: true, results, model: RERANK_MODEL, latencyMs: Date.now() - startTime });
+  } catch (error) {
+    console.error('Rerank error:', error.message);
+    emitAIError('rerank', 'general', error, startTime);
+    res.status(502).json({ error: 'Rerank failed', message: error.message });
+  }
+});
+
+/**
  * GET /
  * API info
  */
@@ -2579,6 +2652,7 @@ app.get('/', (req, res) => {
       'POST /api/ai/chat': 'Multi-turn conversational chat (with context)',
       'POST /api/ai/describe': 'Generate bookmark descriptions',
       'POST /api/ai/embed': 'Generate text embeddings (single or batch)',
+      'POST /api/ai/rerank': 'Rerank documents for a query (Qwen3-Reranker on OVMS, Iris Xe)',
       'GET /health': 'Health check with backend status',
       'GET /metrics': 'Prometheus metrics endpoint'
     },
