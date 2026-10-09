@@ -72,6 +72,17 @@ spec:
       # lunary-backend (home): per-request home traffic, which the edge rule
       # excludes (edge = only things that serve files). The scheduler places
       # it; the VPS role=edge PreferNoSchedule taint keeps it at home.
+      # 2026-10-09: CPU-heavy (7d p95 183m) -> PREFER the CPU node m920s
+      # (label homelab/cpu-tier=high); a weighted preference, never a pin.
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 80
+              preference:
+                matchExpressions:
+                  - key: homelab/cpu-tier
+                    operator: In
+                    values: ["high"]
       initContainers:
         - name: install-lunary
           image: python:3.13-slim
