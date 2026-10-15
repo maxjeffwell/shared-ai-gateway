@@ -54,7 +54,14 @@ metadata:
     portfolio: "true"
     tier: ai
 spec:
-  replicas: 1
+  # 2026-10-15: 2 replicas (+ anti-affinity and PDB below) so a server loss or
+  # a deploy never takes the AI proxy down. Stateless; config is a ConfigMap.
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: litellm
@@ -83,6 +90,14 @@ spec:
                   - key: homelab/cpu-tier
                     operator: In
                     values: ["high"]
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: litellm
       initContainers:
         - name: install-lunary
           image: python:3.13-slim
@@ -204,3 +219,16 @@ spec:
       ports:
         - protocol: TCP
           port: 4000
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: litellm
+  namespace: default
+  labels:
+    app: litellm
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: litellm
