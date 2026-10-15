@@ -85,8 +85,15 @@ spec:
               value: "claude-sonnet-4-20250514"
             - name: CACHE_ENABLED
               value: "true"
+            # Redis password comes from Doppler via ESO (default/redis-secrets,
+            # the same Secret the redis StatefulSet and bookmarked use).
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-secrets
+                  key: redis-password
             - name: REDIS_URL
-              value: "redis://:redis123@redis:6379"
+              value: "redis://:$(REDIS_PASSWORD)@redis:6379"
             - name: LITELLM_URL
               value: "https://litellm.el-jefe.me"
             # Embeddings: OpenVINO Model Server on the Intel iGPU (e5-large, 1024-d).
