@@ -73,6 +73,9 @@ spec:
         portfolio: "true"
         tier: ai
     spec:
+      # 2026-10-15: same class as the gateway so a server loss reschedules the
+      # proxy ahead of unclassified pods (N-1 preemption ladder).
+      priorityClassName: ai-workload
       # Not pinned to the edge any more (2026-10-07). It was put on role=edge
       # on 9/25 because its upstreams were Anthropic/Groq over the internet,
       # but it now also routes to OVMS (ovms-llm, home) and logs every call to
