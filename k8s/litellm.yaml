@@ -43,6 +43,13 @@ data:
       set_verbose: false
       success_callback: ["lunary"]
       failure_callback: ["lunary"]
+
+    # 2026-10-23: database on the native Patroni cluster (spend logs, virtual keys) and a master
+    # key, so every request now needs a key (shared-ai-gateway has its own virtual key).
+    # DATABASE_URL / LITELLM_MASTER_KEY / LITELLM_SALT_KEY come from secret litellm-secrets (ESO).
+    general_settings:
+      master_key: os.environ/LITELLM_MASTER_KEY
+      database_url: os.environ/DATABASE_URL
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -84,8 +91,16 @@ spec:
       # it; the VPS role=edge PreferNoSchedule taint keeps it at home.
       # 2026-10-09: CPU-heavy (7d p95 183m) -> PREFER the CPU node m920s
       # (label homelab/cpu-tier=high); a weighted preference, never a pin.
+      # 2026-10-23: REQUIRED servers-only -- the Patroni VIP (its database) is
+      # unreachable from the VPS and the GPU nodes are not for this.
       affinity:
         nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["elitedesk", "m720q", "m920s"]
           preferredDuringSchedulingIgnoredDuringExecution:
             - weight: 80
               preference:
@@ -147,6 +162,9 @@ spec:
                   key: LUNARY_PUBLIC_KEY
             - name: LUNARY_API_URL
               value: "http://lunary-backend.lunary.svc.cluster.local:3333"
+          envFrom:
+            - secretRef:
+                name: litellm-secrets
           resources:
             requests:
               cpu: 100m
@@ -160,6 +178,10 @@ spec:
               subPath: config.yaml
             - name: lunary-pkg
               mountPath: /opt/lunary
+            # Patroni CA; DATABASE_URL uses Prisma's sslcert=/etc/pg-ha/ca.crt&sslaccept=strict
+            - name: pg-ha-ca
+              mountPath: /etc/pg-ha
+              readOnly: true
           livenessProbe:
             httpGet:
               path: /health/liveliness  # Don't use /health - it makes real API calls!
@@ -180,6 +202,13 @@ spec:
             name: litellm-config
         - name: lunary-pkg
           emptyDir: {}
+        - name: pg-ha-ca
+          secret:
+            secretName: pg-ha-ca
+            items:
+              - key: ca.crt
+                path: ca.crt
+                mode: 0444
 ---
 apiVersion: v1
 kind: Service
