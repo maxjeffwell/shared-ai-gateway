@@ -222,6 +222,8 @@ const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514
 // Used with Lens Loop for observability (Lens Loop → LiteLLM → Anthropic)
 // External URL via Cloudflare tunnel so Lens Loop (external) can reach it
 const LITELLM_URL = process.env.LITELLM_URL || 'https://litellm.el-jefe.me';
+// LiteLLM virtual key for this gateway (LiteLLM enforces keys since 2026-10-23; spend is tracked per key)
+const LITELLM_API_KEY = process.env.LITELLM_API_KEY || 'not-needed';
 
 // Initialize Anthropic client (native SDK - fallback when Lens Loop unavailable)
 let anthropicClient = null;
@@ -295,7 +297,7 @@ if (isLensLoopConfigured() && ANTHROPIC_API_KEY) {
   const lensLoopBaseUrl = `${LENS_LOOP_PROXY}/openai/${protocol}/${litellmHost}/v1`;
 
   openaiClientForClaude = new OpenAI({
-    apiKey: 'not-needed', // LiteLLM uses its own API key
+    apiKey: LITELLM_API_KEY,
     baseURL: lensLoopBaseUrl,
     defaultHeaders: {
       'X-Loop-Project': LENS_LOOP_PROJECT
@@ -309,7 +311,7 @@ if (isLensLoopConfigured() && ANTHROPIC_API_KEY) {
 let claudeClientWithLiteLLM = null;
 if (LITELLM_URL && ANTHROPIC_API_KEY) {
   claudeClientWithLiteLLM = new OpenAI({
-    apiKey: 'not-needed', // LiteLLM uses its own API key
+    apiKey: LITELLM_API_KEY,
     baseURL: `${LITELLM_URL}/v1`
   });
   console.log(`[Anthropic] LiteLLM direct enabled for Lunary: ${LITELLM_URL}/v1`);
@@ -325,7 +327,7 @@ if (isLensLoopConfigured() && GROQ_API_KEY) {
   const lensLoopGroqUrl = `${LENS_LOOP_PROXY}/openai/${protocol}/${litellmHost}/v1`;
 
   groqClientWithLensLoop = new OpenAI({
-    apiKey: 'not-needed', // LiteLLM uses its own API key
+    apiKey: LITELLM_API_KEY,
     baseURL: lensLoopGroqUrl,
     defaultHeaders: {
       'X-Loop-Project': LENS_LOOP_PROJECT
@@ -339,7 +341,7 @@ if (isLensLoopConfigured() && GROQ_API_KEY) {
 let groqClientWithLiteLLM = null;
 if (LITELLM_URL && GROQ_API_KEY) {
   groqClientWithLiteLLM = new OpenAI({
-    apiKey: 'not-needed', // LiteLLM uses its own API key
+    apiKey: LITELLM_API_KEY,
     baseURL: `${LITELLM_URL}/v1`
   });
   console.log(`[Groq] LiteLLM direct enabled for Lunary: ${LITELLM_URL}/v1`);
