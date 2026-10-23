@@ -59,7 +59,7 @@ spec:
               memory: 32Mi
       containers:
         - name: ai-gateway
-          image: maxjeffwell/shared-ai-gateway:a29397821fd3e1fff8c4fe1f0b2f0d38a43ca194   # pinned: mirror.gcr.io (neon/dm) serves stale :latest
+          image: maxjeffwell/shared-ai-gateway:5262879243dfc1c1b3a2f827ac485427453ea3d0   # pinned: mirror.gcr.io (neon/dm) serves stale :latest
           ports:
             - containerPort: 8002
               name: http
@@ -94,8 +94,14 @@ spec:
                   key: redis-password
             - name: REDIS_URL
               value: "redis://:$(REDIS_PASSWORD)@redis:6379"
+            # 2026-10-23: in-cluster (was the public tunnel host) + this gateway's LiteLLM virtual key
             - name: LITELLM_URL
-              value: "https://litellm.el-jefe.me"
+              value: "http://litellm.default.svc.cluster.local:4000"
+            - name: LITELLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ai-gateway-credentials
+                  key: LITELLM_API_KEY
             # Embeddings: OpenVINO Model Server on the Intel iGPU (e5-large, 1024-d).
             # Replaced the Triton/bge tiers 2026-09-30. Both tiers point at OVMS.
             - name: EMBEDDING_API
