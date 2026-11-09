@@ -1016,15 +1016,14 @@ app.use(express.json());
  * and are already fenced by NetworkPolicies; only a few callers (Firebase Cloud Functions,
  * backfill/indexing scripts, the blackbox probe) come in from the internet.
  *
- * A request that passed through a reverse proxy always carries the forwarding headers that the
- * proxy adds (cloudflared: cf-connecting-ip / cf-ray; Traefik: x-forwarded-for / x-real-ip).
- * A client can add headers but cannot strip the ones a proxy adds, so "has proxy headers" is a
- * safe definition of "came from the internet". Those requests must present a key; direct
- * in-cluster calls are unchanged.
+ * Public traffic is separated by LISTENER, not by headers (headers can be forged or stripped):
+ * the app also listens on PUBLIC_PORT, and the Service the tunnel and ingress use
+ * (shared-ai-gateway-service) targets that port. Every request that arrives on PUBLIC_PORT needs a
+ * key; requests on PORT (the in-cluster Service shared-ai-gateway) are unchanged.
  *
  * GATEWAY_AUTH_MODE: off | report | enforce   (default off)
  *   report  - log would-be rejections, let everything through (rollout verification)
- *   enforce - reject public requests without a valid key with 401
+ *   enforce - reject public-port requests without a valid key with 401
  * GATEWAY_CLIENT_KEYS: comma-separated name:key pairs, e.g. "firebook:abc,scripts:def"
  * Keys are accepted as `X-API-Key: <key>` or `Authorization: Bearer <key>`.
  * /livez stays open so external uptime probes keep working.
@@ -1042,7 +1041,7 @@ const GATEWAY_CLIENT_KEYS = (process.env.GATEWAY_CLIENT_KEYS || '')
   })
   .filter((c) => c.key.length >= 24);
 const PUBLIC_AUTH_EXEMPT_PATHS = new Set(['/livez']);
-const PROXY_HEADERS = ['cf-connecting-ip', 'cf-ray', 'x-forwarded-for', 'x-real-ip'];
+const PUBLIC_PORT = parseInt(process.env.PUBLIC_PORT || '8003', 10);
 
 const authDecisions = new promClient.Counter({
   name: 'ai_gateway_public_auth_total',
@@ -1063,8 +1062,8 @@ function matchClientKey(presented) {
 
 app.use((req, res, next) => {
   if (GATEWAY_AUTH_MODE === 'off') return next();
-  const proxied = PROXY_HEADERS.some((h) => req.headers[h] !== undefined);
-  if (!proxied || PUBLIC_AUTH_EXEMPT_PATHS.has(req.path)) return next();
+  const onPublicPort = req.socket.localPort === PUBLIC_PORT;
+  if (!onPublicPort || PUBLIC_AUTH_EXEMPT_PATHS.has(req.path)) return next();
 
   const bearer = (req.headers.authorization || '').match(/^Bearer\s+(.+)$/i);
   const presented = req.headers['x-api-key'] || (bearer && bearer[1]);
@@ -2911,6 +2910,11 @@ async function warmupBackends() {
     }
   }
   console.log('[Warmup] Backend warmup complete');
+}
+
+// Public listener: same app, but every request here must carry a client key (see auth block).
+if (PUBLIC_PORT && PUBLIC_PORT !== Number(PORT)) {
+  app.listen(PUBLIC_PORT, () => console.log(`[auth] public listener on :${PUBLIC_PORT} (mode ${GATEWAY_AUTH_MODE}, ${GATEWAY_CLIENT_KEYS.length} client key(s))`));
 }
 
 app.listen(PORT, async () => {
