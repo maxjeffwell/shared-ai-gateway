@@ -70,12 +70,12 @@ spec:
           env:
             - name: PORT
               value: "8002"
-            # Public (proxied) requests need a client key. report = log/count only; switch to
-            # enforce once every public caller sends X-API-Key (see server.js auth block).
+            # Requests on the public listener (8003) need a client key; enforced since 2026-11-09.
+            # Callers: firebook Cloud Functions, scripts. /livez stays open for the blackbox probe.
             - name: PUBLIC_PORT
               value: "8003"
             - name: GATEWAY_AUTH_MODE
-              value: "report"
+              value: "enforce"
             - name: GATEWAY_CLIENT_KEYS
               valueFrom:
                 secretKeyRef:
