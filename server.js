@@ -5,7 +5,7 @@ import fetch from 'node-fetch';
 import dns from 'node:dns/promises';
 import net from 'node:net';
 import https from 'node:https';
-import { createHash } from 'crypto';
+import { createHash, timingSafeEqual } from 'crypto';
 import Redis from 'ioredis';
 import promClient from 'prom-client';
 import Anthropic from '@anthropic-ai/sdk';
@@ -1007,6 +1007,81 @@ async function inference(prompt, options = {}) {
 
 app.use(cors());
 app.use(express.json());
+
+/**
+ * Client authentication for PUBLIC requests.
+ *
+ * The gateway is published at https://ai-gateway.el-jefe.me (Cloudflare tunnel, and a Traefik
+ * ingress on the edge VPS). Most callers are in-cluster services that hit the Service directly
+ * and are already fenced by NetworkPolicies; only a few callers (Firebase Cloud Functions,
+ * backfill/indexing scripts, the blackbox probe) come in from the internet.
+ *
+ * A request that passed through a reverse proxy always carries the forwarding headers that the
+ * proxy adds (cloudflared: cf-connecting-ip / cf-ray; Traefik: x-forwarded-for / x-real-ip).
+ * A client can add headers but cannot strip the ones a proxy adds, so "has proxy headers" is a
+ * safe definition of "came from the internet". Those requests must present a key; direct
+ * in-cluster calls are unchanged.
+ *
+ * GATEWAY_AUTH_MODE: off | report | enforce   (default off)
+ *   report  - log would-be rejections, let everything through (rollout verification)
+ *   enforce - reject public requests without a valid key with 401
+ * GATEWAY_CLIENT_KEYS: comma-separated name:key pairs, e.g. "firebook:abc,scripts:def"
+ * Keys are accepted as `X-API-Key: <key>` or `Authorization: Bearer <key>`.
+ * /livez stays open so external uptime probes keep working.
+ */
+const GATEWAY_AUTH_MODE = (process.env.GATEWAY_AUTH_MODE || 'off').toLowerCase();
+const GATEWAY_CLIENT_KEYS = (process.env.GATEWAY_CLIENT_KEYS || '')
+  .split(',')
+  .map((pair) => pair.trim())
+  .filter(Boolean)
+  .map((pair) => {
+    const idx = pair.indexOf(':');
+    return idx > 0
+      ? { name: pair.slice(0, idx), key: Buffer.from(pair.slice(idx + 1)) }
+      : { name: 'unnamed', key: Buffer.from(pair) };
+  })
+  .filter((c) => c.key.length >= 24);
+const PUBLIC_AUTH_EXEMPT_PATHS = new Set(['/livez']);
+const PROXY_HEADERS = ['cf-connecting-ip', 'cf-ray', 'x-forwarded-for', 'x-real-ip'];
+
+const authDecisions = new promClient.Counter({
+  name: 'ai_gateway_public_auth_total',
+  help: 'Public (proxied) requests by auth outcome',
+  labelNames: ['outcome', 'client'],
+});
+
+function matchClientKey(presented) {
+  if (!presented) return null;
+  const candidate = Buffer.from(presented);
+  for (const client of GATEWAY_CLIENT_KEYS) {
+    if (client.key.length === candidate.length && timingSafeEqual(client.key, candidate)) {
+      return client.name;
+    }
+  }
+  return null;
+}
+
+app.use((req, res, next) => {
+  if (GATEWAY_AUTH_MODE === 'off') return next();
+  const proxied = PROXY_HEADERS.some((h) => req.headers[h] !== undefined);
+  if (!proxied || PUBLIC_AUTH_EXEMPT_PATHS.has(req.path)) return next();
+
+  const bearer = (req.headers.authorization || '').match(/^Bearer\s+(.+)$/i);
+  const presented = req.headers['x-api-key'] || (bearer && bearer[1]);
+  const client = matchClientKey(presented);
+  if (client) {
+    authDecisions.inc({ outcome: 'accepted', client });
+    return next();
+  }
+
+  const source = req.headers['cf-connecting-ip'] || req.headers['x-real-ip'] || req.headers['x-forwarded-for'] || req.ip;
+  authDecisions.inc({ outcome: GATEWAY_AUTH_MODE === 'enforce' ? 'rejected' : 'would_reject', client: 'none' });
+  console.warn(`[auth] ${GATEWAY_AUTH_MODE === 'enforce' ? 'REJECT' : 'would reject'} ${req.method} ${req.path} from ${source} (${presented ? 'bad key' : 'no key'})`);
+  if (GATEWAY_AUTH_MODE === 'enforce') {
+    return res.status(401).json({ error: 'API key required for public access' });
+  }
+  return next();
+});
 
 // System prompts for different applications
 const SYSTEM_PROMPTS = {
