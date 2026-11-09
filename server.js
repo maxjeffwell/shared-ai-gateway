@@ -27,7 +27,7 @@ dotenv.config();
 // =============================================================================
 // PROMETHEUS METRICS
 // =============================================================================
-promClient.collectDefaultMetrics({ prefix: 'gateway_' });
+promClient.collectDefaultMetrics({ prefix: 'gateway_', eventLoopMonitoringPrecision: 100 });
 
 const requestCounter = new promClient.Counter({
   name: 'gateway_requests_total',
