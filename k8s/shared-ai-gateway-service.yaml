@@ -18,5 +18,5 @@ spec:
   - name: http
     port: 8002
     protocol: TCP
-    targetPort: 8002
+    targetPort: 8003   # public listener: client key required (Cloudflare tunnel + ingress use this Service)
   sessionAffinity: None
