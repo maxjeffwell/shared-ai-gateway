@@ -59,7 +59,7 @@ spec:
               memory: 32Mi
       containers:
         - name: ai-gateway
-          image: maxjeffwell/shared-ai-gateway:fa0639bca546f8a9e0399fb47c2965d7abb726f4   # pinned: mirror.gcr.io (neon/dm) serves stale :latest
+          image: maxjeffwell/shared-ai-gateway:be838b5e9bae77e459400973bf9037973310ad82   # pinned: mirror.gcr.io (neon/dm) serves stale :latest
           ports:
             - containerPort: 8002
               name: http
@@ -67,6 +67,16 @@ spec:
           env:
             - name: PORT
               value: "8002"
+            # Public (proxied) requests need a client key. report = log/count only; switch to
+            # enforce once every public caller sends X-API-Key (see server.js auth block).
+            - name: GATEWAY_AUTH_MODE
+              value: "report"
+            - name: GATEWAY_CLIENT_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: ai-gateway-credentials
+                  key: GATEWAY_CLIENT_KEYS
+                  optional: true
             - name: BACKEND_PREFERENCE
               value: "auto"
             - name: GROQ_API_KEY
