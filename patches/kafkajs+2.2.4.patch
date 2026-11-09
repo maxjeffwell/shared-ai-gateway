@@ -1,0 +1,20 @@
+diff --git a/node_modules/kafkajs/src/network/requestQueue/index.js b/node_modules/kafkajs/src/network/requestQueue/index.js
+index eee14d6..4fa3a85 100644
+--- a/node_modules/kafkajs/src/network/requestQueue/index.js
++++ b/node_modules/kafkajs/src/network/requestQueue/index.js
+@@ -304,6 +304,15 @@ module.exports = class RequestQueue extends EventEmitter {
+    * the pending request queue eventually.
+    */
+   scheduleCheckPendingRequests() {
++    // Nothing queued and no client-side throttle in effect: there is nothing to
++    // re-check later. A new request re-enters through push(), and every fulfilled
++    // or timed-out in-flight request calls checkPendingRequests() directly.
++    // Without this guard `scheduleAt` below is negative while idle, Node clamps it
++    // to 1 ms, and the timer re-arms itself forever (tulios/kafkajs#1704).
++    if (this.pending.length === 0 && this.throttledUntil <= Date.now()) {
++      return
++    }
++
+     // If we're throttled: Schedule checkPendingRequests when the throttle
+     // should be resolved. If there is already something scheduled we assume that that
+     // will be fine, and potentially fix up a new timeout if needed at that time.

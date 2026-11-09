@@ -4,6 +4,8 @@ WORKDIR /app
 
 # Copy package files
 COPY package*.json ./
+# patch-package runs as postinstall during npm ci, so the patches must already be present
+COPY patches ./patches
 
 # Install dependencies (BuildKit cache speeds up repeated builds)
 RUN --mount=type=cache,target=/root/.npm \
