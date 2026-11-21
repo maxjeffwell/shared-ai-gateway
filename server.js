@@ -1451,13 +1451,20 @@ app.post('/api/ai/generate', async (req, res) => {
 //      Groq; 4. keyword extraction remains the last resort.
 // ---------------------------------------------------------------------------
 const TAG_SYSTEM_PROMPT = `You tag web bookmarks for a personal bookmark manager.
-Return 3-5 tags as a JSON array of lowercase strings.
+Return 6-8 tags as a JSON array of lowercase strings.
 Rules:
 - a tag is one or two words joined by a hyphen, e.g. "kubernetes", "git-worktree"; never underscores or spaces
-- prefer, in this order: the product or project name, the technology or language, the topic, the content type (docs, tutorial, article, tool, video, reference)
+- cover, in this order: the product or project name, the technology or language, the topic, what it is used for, the content type (docs, tutorial, article, tool, video, reference)
+- every tag must say something different; no near-duplicates such as "docs" and "documentation"
 - use only the title, URL and description you are given; never invent what the page is about
 - do not output generic tags such as website, web, online, page, link, internet, software, technology
 Output only the JSON array.`;
+
+// Every AI answer carries at least TAG_MIN tags (user decision 2026-11-20) and
+// at most TAG_MAX. The prompt asks for 6-8 so that TAG_MIN still survive
+// normalization.
+const TAG_MIN = 5;
+const TAG_MAX = 8;
 
 const TAG_STOPLIST = new Set([
   'website', 'websites', 'web', 'site', 'online', 'page', 'pages', 'link', 'links', 'internet',
@@ -1475,7 +1482,34 @@ function normalizeTags(raw) {
       .replace(/^-+|-+$/g, '');
     if (t.length < 2 || t.length > 30 || TAG_STOPLIST.has(t)) continue;
     if (!out.includes(t)) out.push(t);
-    if (out.length === 5) break;
+    if (out.length === TAG_MAX) break;
+  }
+  return out;
+}
+
+// Join tag lists in priority order, without duplicates, up to TAG_MAX.
+function mergeTags(...lists) {
+  const out = [];
+  for (const t of lists.flat()) {
+    if (!out.includes(t)) out.push(t);
+    if (out.length === TAG_MAX) break;
+  }
+  return out;
+}
+
+// When the models return fewer than TAG_MIN tags, fill the gap with words
+// taken from the bookmark itself. A word already present as part of a tag
+// ("kubernetes" beside "kubernetes-docs"), or differing from one only by an
+// ending ("container" beside "containers"), is skipped.
+function topUpTags(tags, ctx) {
+  const out = [...tags];
+  const parts = new Set(out.flatMap(t => [t, ...t.split(/[-.]/)]));
+  const title = [ctx.title, ctx.pageTitle].filter(Boolean).join(' ');
+  for (const word of normalizeTags(extractKeywordTags(title, ctx.url, ctx.description))) {
+    if (out.length >= TAG_MIN) break;
+    if ([...parts].some(p => p.startsWith(word) || word.startsWith(p))) continue;
+    out.push(word);
+    parts.add(word);
   }
   return out;
 }
@@ -1622,7 +1656,7 @@ function buildTagPrompt(ctx) {
   lines.push(`URL: ${ctx.url}`);
   if (ctx.siteName) lines.push(`Site: ${ctx.siteName}`);
   if (ctx.description) lines.push(`Description: ${ctx.description}`);
-  return `Bookmark:\n${lines.join('\n')}\n\nJSON array of 3-5 tags:`;
+  return `Bookmark:\n${lines.join('\n')}\n\nJSON array of 6-8 tags:`;
 }
 
 /**
@@ -1680,9 +1714,10 @@ app.post('/api/ai/tags', async (req, res) => {
       }
       const prompt = buildTagPrompt(ctx);
       const messages = [{ role: 'system', content: TAG_SYSTEM_PROMPT }, { role: 'user', content: prompt }];
-      const llmOpts = { maxTokens: 60, temperature: 0.2 };
+      // Eight two-word tags as JSON need about 70 tokens; 60 cut the list short.
+      const llmOpts = { maxTokens: 120, temperature: 0.2 };
 
-      const cacheKey = getCacheKey(prompt, { task: 'tags', v: 2 });
+      const cacheKey = getCacheKey(prompt, { task: 'tags', v: 3 });
       const cached = await getFromCache(cacheKey);
       if (cached) {
         console.log(`[bookmarks] ✓ cached tags (${cached.backend}):`, cached.tags);
@@ -1691,6 +1726,8 @@ app.post('/api/ai/tags', async (req, res) => {
 
       let result = null;
       let tags = [];
+      // Local tags good enough to keep beside Groq's if Groq is also short.
+      let keepLocal = [];
       let escalateReason = null;
 
       // 1) Local iGPU model first.
@@ -1701,6 +1738,10 @@ app.post('/api/ai/tags', async (req, res) => {
           if (tagsLookPoor(tags, ctx)) {
             escalateReason = 'poor-tags';
             console.log(`[bookmarks] OVMS tags not grounded in the bookmark, escalating:`, tags);
+          } else if (tags.length < TAG_MIN) {
+            escalateReason = 'too-few-tags';
+            keepLocal = tags;
+            console.log(`[bookmarks] OVMS returned ${tags.length} tags, fewer than ${TAG_MIN}, escalating:`, tags);
           }
         } catch (ovmsError) {
           escalateReason = 'error';
@@ -1718,7 +1759,7 @@ app.post('/api/ai/tags', async (req, res) => {
           const groqTags = normalizeTags(parseTags(groqResult.response, title));
           if (groqTags.length >= 2) {
             result = groqResult;
-            tags = groqTags;
+            tags = mergeTags(groqTags, keepLocal);
           }
         } catch (groqError) {
           console.log(`[bookmarks] Groq fallback failed: ${groqError.message}`);
@@ -1727,6 +1768,14 @@ app.post('/api/ai/tags', async (req, res) => {
 
       if (!result || tags.length < 2) {
         throw new Error(`no usable AI tags (${escalateReason || 'empty'})`);
+      }
+
+      // 3) Still short of TAG_MIN: fill up from the bookmark's own words.
+      let toppedUp = 0;
+      if (tags.length < TAG_MIN) {
+        const fromModels = tags.length;
+        tags = topUpTags(tags, ctx);
+        toppedUp = tags.length - fromModels;
       }
 
       console.log(`[bookmarks] ✓ AI generated ${tags.length} tags via ${result.backend}${escalateReason ? ` (fallback: ${escalateReason})` : ''}:`, tags);
@@ -1739,7 +1788,8 @@ app.post('/api/ai/tags', async (req, res) => {
         backend: result.backend,
         model: result.model,
         enriched,
-        fallback: escalateReason || undefined
+        fallback: escalateReason || undefined,
+        toppedUp: toppedUp || undefined
       };
       await setInCache(cacheKey, payload);
       return res.json({ ...payload, title, url });
@@ -2815,7 +2865,7 @@ function extractKeywordTags(title, url, description) {
     });
   }
 
-  return [...new Set(tagArray)].slice(0, 5);  // Deduplicate and limit to 5
+  return [...new Set(tagArray)].slice(0, 8);  // Deduplicate and limit to 8
 }
 
 // Utility: Parse tags from AI response
@@ -2833,7 +2883,7 @@ function parseTags(text, fallbackTitle) {
     if (jsonMatch) {
       try {
         const parsed = JSON.parse(jsonMatch[0]);
-        if (Array.isArray(parsed)) return parsed.map(t => String(t).trim().toLowerCase()).filter(Boolean).slice(0, 5);
+        if (Array.isArray(parsed)) return parsed.map(t => String(t).trim().toLowerCase()).filter(Boolean).slice(0, 12);
       } catch {
         // Small models often emit [a, b, c] without quotes: split the inner list instead
         text = jsonMatch[1];
@@ -2848,13 +2898,13 @@ function parseTags(text, fallbackTitle) {
     );
 
     if (commaSplit.length > 0) {
-      return commaSplit.filter(t => t && t.length > 2).slice(0, 5);
+      return commaSplit.filter(t => t && t.length > 2).slice(0, 12);
     }
 
     // Extract words as fallback
     const words = text.match(/\b[a-z]+\b/gi) || [];
     const uniqueWords = [...new Set(words.map(w => w.toLowerCase()))];
-    return uniqueWords.filter(w => w.length > 3).slice(0, 5);
+    return uniqueWords.filter(w => w.length > 3).slice(0, 12);
 
   } catch (error) {
     console.warn('Tag parsing fallback:', error.message);
