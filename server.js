@@ -2429,6 +2429,13 @@ async function checkEmbeddingHealth(backend) {
 // in turn, so an over-long post or code chunk gets an embedding of its beginning
 // rather than failing the whole request.
 const EMBEDDING_TRUNCATE_STEPS = [1800, 1200, 800, 400];
+// Bounds on that recovery, so one over-long text cannot turn a request into an
+// unbounded series of upstream calls: it only runs for small batches, and it
+// stops at a deadline. Larger batches get the model server's error back.
+const EMBEDDING_RECOVERY_MAX_BATCH = 64;
+const EMBEDDING_RECOVERY_DEADLINE_MS = 60000;
+// No text this long can fit the model's limit; cut it before the first attempt.
+const EMBEDDING_HARD_MAX_CHARS = 8000;
 const isInputTooLong = (message) => /longer than allowed/i.test(String(message));
 
 async function postOpenAIEmbedding(url, inputTexts) {
@@ -2451,9 +2458,10 @@ async function postOpenAIEmbedding(url, inputTexts) {
 }
 
 // One text, shortened step by step only if the model rejects it as too long.
-async function embedOneWithTruncation(url, text) {
+async function embedOneWithTruncation(url, text, deadline) {
   let current = String(text ?? '');
   for (let step = 0; ; step++) {
+    if (Date.now() > deadline) throw new Error('Embedding error: gave up shortening over-long inputs (time limit)');
     try {
       return (await postOpenAIEmbedding(url, [current]))[0];
     } catch (error) {
@@ -2470,16 +2478,17 @@ async function embedOneWithTruncation(url, text) {
  * Same return shape as callTritonEmbedding.
  */
 async function callOpenAIEmbedding(url, texts) {
-  const inputTexts = Array.isArray(texts) ? texts : [texts];
+  const inputTexts = (Array.isArray(texts) ? texts : [texts]).map(t => String(t ?? '').slice(0, EMBEDDING_HARD_MAX_CHARS));
   console.log(`[Embedding] Calling OpenAI-compatible embeddings at ${url} (${EMBEDDING_MODEL}) with ${inputTexts.length} text(s)`);
   let vectors;
   try {
     vectors = await postOpenAIEmbedding(url, inputTexts);
   } catch (error) {
-    if (!isInputTooLong(error.message)) throw error;
+    if (!isInputTooLong(error.message) || inputTexts.length > EMBEDDING_RECOVERY_MAX_BATCH) throw error;
     // The server does not say which text was too long: embed them one at a time.
+    const deadline = Date.now() + EMBEDDING_RECOVERY_DEADLINE_MS;
     vectors = [];
-    for (const text of inputTexts) vectors.push(await embedOneWithTruncation(url, text));
+    for (const text of inputTexts) vectors.push(await embedOneWithTruncation(url, text, deadline));
   }
   const dimensions = vectors[0]?.length || 0;
   if (!Array.isArray(texts)) {
