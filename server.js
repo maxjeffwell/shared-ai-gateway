@@ -2423,13 +2423,15 @@ async function checkEmbeddingHealth(backend) {
   }
 }
 
-/**
- * Call an OpenAI-compatible embeddings endpoint (OpenVINO Model Server /v3/embeddings).
- * Same return shape as callTritonEmbedding.
- */
-async function callOpenAIEmbedding(url, texts) {
-  const inputTexts = Array.isArray(texts) ? texts : [texts];
-  console.log(`[Embedding] Calling OpenAI-compatible embeddings at ${url} (${EMBEDDING_MODEL}) with ${inputTexts.length} text(s)`);
+// The embedding model has a hard input limit (e5-large: 512 tokens) and the model
+// server answers 400 "Input length N longer than allowed M" instead of truncating.
+// Texts that fit are never touched. A text that is too long is cut to these sizes
+// in turn, so an over-long post or code chunk gets an embedding of its beginning
+// rather than failing the whole request.
+const EMBEDDING_TRUNCATE_STEPS = [1800, 1200, 800, 400];
+const isInputTooLong = (message) => /longer than allowed/i.test(String(message));
+
+async function postOpenAIEmbedding(url, inputTexts) {
   const response = await fetch(`${url}/v3/embeddings`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -2445,7 +2447,40 @@ async function callOpenAIEmbedding(url, texts) {
   if (items.length !== inputTexts.length) {
     throw new Error(`Embedding response had ${items.length} vectors for ${inputTexts.length} inputs`);
   }
-  const vectors = items.map(i => i.embedding);
+  return items.map(i => i.embedding);
+}
+
+// One text, shortened step by step only if the model rejects it as too long.
+async function embedOneWithTruncation(url, text) {
+  let current = String(text ?? '');
+  for (let step = 0; ; step++) {
+    try {
+      return (await postOpenAIEmbedding(url, [current]))[0];
+    } catch (error) {
+      const limit = EMBEDDING_TRUNCATE_STEPS[step];
+      if (!isInputTooLong(error.message) || limit === undefined) throw error;
+      console.warn(`[Embedding] input of ${current.length} chars is over the model limit; retrying with the first ${limit}`);
+      current = current.slice(0, limit);
+    }
+  }
+}
+
+/**
+ * Call an OpenAI-compatible embeddings endpoint (OpenVINO Model Server /v3/embeddings).
+ * Same return shape as callTritonEmbedding.
+ */
+async function callOpenAIEmbedding(url, texts) {
+  const inputTexts = Array.isArray(texts) ? texts : [texts];
+  console.log(`[Embedding] Calling OpenAI-compatible embeddings at ${url} (${EMBEDDING_MODEL}) with ${inputTexts.length} text(s)`);
+  let vectors;
+  try {
+    vectors = await postOpenAIEmbedding(url, inputTexts);
+  } catch (error) {
+    if (!isInputTooLong(error.message)) throw error;
+    // The server does not say which text was too long: embed them one at a time.
+    vectors = [];
+    for (const text of inputTexts) vectors.push(await embedOneWithTruncation(url, text));
+  }
   const dimensions = vectors[0]?.length || 0;
   if (!Array.isArray(texts)) {
     return { embedding: vectors[0], dimensions };
